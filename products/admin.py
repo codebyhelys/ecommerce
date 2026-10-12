@@ -1,14 +1,32 @@
 from django.contrib import admin
-from .models import Produto, Category
+
+from .models import Category, Product
+
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
     list_display = ["name", "slug"]
+    search_fields = ["name"]
     prepopulated_fields = {"slug": ("name",)}
 
-@admin.register(Produto)
-class ProdutoAdmin(admin.ModelAdmin):
+
+@admin.register(Product)
+class ProductAdmin(admin.ModelAdmin):
     list_display = ["name", "price", "stock", "category", "is_active"]
     search_fields = ["name"]
     list_filter = ["is_active", "category"]
+    autocomplete_fields = ["category"]
     prepopulated_fields = {"slug": ("name",)}
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+    actions = ["activate", "deactivate"]
+
+    @admin.action(description="Ativar produtos selecionados")
+    def activate(self, request, queryset):
+        updated = queryset.update(is_active=True)
+        self.message_user(request, f"{updated} produto(s) ativado(s).")
+
+    @admin.action(description="Desativar produtos selecionados")
+    def deactivate(self, request, queryset):
+        updated = queryset.update(is_active=False)
+        self.message_user(request, f"{updated} produto(s) desativado(s).")
