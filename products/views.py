@@ -1,10 +1,21 @@
-from rest_framework import viewsets, permissions
-from .models import Product
-from .serializers import ProductSerializer
+from django.db.models import Count, Q
+from django.db.models.deletion import ProtectedError
+from rest_framework import permissions, status, viewsets
+from rest_framework.exceptions import APIException
+
+from .filters import ProductFilter
+from .models import Category, Product
+from .permissions import IsAdminOrReadOnly
+from .serializers import CategorySerializer, ProductSerializer
+
 
 class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
     lookup_field = "slug"
+    filterset_class = ProductFilter
+    search_fields = ["name", "description"]
+    ordering_fields = ["price", "created_at", "name"]
+    ordering = ["-created_at"]
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
@@ -21,3 +32,27 @@ class ProductViewSet(viewsets.ModelViewSet):
         # soft delete: desativa em vez de apagar, para preservar o histórico de pedidos
         instance.is_active = False
         instance.save(update_fields=["is_active", "updated_at"])
+
+
+class CategoryInUse(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "Categoria possui produtos e não pode ser removida."
+    default_code = "category_in_use"
+
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    serializer_class = CategorySerializer
+    permission_classes = [IsAdminOrReadOnly]
+    lookup_field = "slug"
+    pagination_class = None
+
+    def get_queryset(self):
+        return Category.objects.annotate(
+            products_count=Count("products", filter=Q(products__is_active=True))
+        ).order_by("name")
+
+    def perform_destroy(self, instance):
+        try:
+            instance.delete()
+        except ProtectedError:
+            raise CategoryInUse()
