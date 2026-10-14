@@ -15,6 +15,11 @@ def main():
             "available on your PYTHONPATH environment variable? Did you "
             "forget to activate a virtual environment?"
         ) from exc
+    if len(sys.argv) > 1 and sys.argv[1] == 'runserver':
+        # porta padrão do servidor de desenvolvimento, configurável no .env
+        from decouple import config
+        from django.core.management.commands.runserver import Command as RunserverCommand
+        RunserverCommand.default_port = str(config('DEV_SERVER_PORT', default='8010'))
     execute_from_command_line(sys.argv)
 
 
