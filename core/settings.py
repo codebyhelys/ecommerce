@@ -141,6 +141,7 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticatedOrReadOnly",
         
     ],
+    "DEFAULT_THROTTLE_RATES": {"login": "5/min", "register": "10/hour"},
 }
 AUTH_USER_MODEL = 'accounts.User'
 

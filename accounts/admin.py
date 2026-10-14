@@ -6,7 +6,7 @@ from .models import User
 
 class UserCreationForm(AdminUserCreationForm):
     class Meta:
-        models = User
+        model = User
         fields = ["email",]
 
 @admin.register(User)
