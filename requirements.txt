@@ -3,3 +3,4 @@ djangorestframework==3.17.1
 django-filter==26.1
 psycopg[binary]==3.3.5
 python-decouple==3.8
+django-rest-knox==5.1.0
