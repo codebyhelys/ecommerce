@@ -8,7 +8,7 @@ from .models import Cart, CartItem
 
 class CartProductSerializer(serializers.ModelSerializer):
     class Meta:
-        models = Product
+        model = Product
         fields = ["slug", "name", "price", "stock"]
 
 class CartItemSerializer(serializers.ModelSerializer):
@@ -18,7 +18,7 @@ class CartItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CartItem
-        fields = ["products", "quantity", "subtotal", "available"]
+        fields = ["product", "quantity", "subtotal", "available"]
 
 class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)

@@ -9,7 +9,7 @@ from .models import Cart, CartItem
 MAX_PER_ITEM = 99
 
 def get_cart(user):
-    qs = Cart.objects.prefetch_related(Prefetch("items", queryset=CartItem.objects.select_related(Product)))
+    qs = Cart.objects.prefetch_related(Prefetch("items", queryset=CartItem.objects.select_related("product")))
     cart = qs.filter(user=user).first() 
     if cart is None : 
         Cart.objects.get_or_create(user=user)
@@ -30,7 +30,7 @@ def _check_quantity(product, quantity):
 
 @transaction.atomic
 def add_item(user, product, quantity):
-    cart = Cart.objects.get_or_create(user=user)
+    cart, _ = Cart.objects.get_or_create(user=user)
     product = _active_product(product)
     _check_quantity(product, quantity)
 
@@ -39,11 +39,11 @@ def add_item(user, product, quantity):
         new_quantity = item.quantity + quantity
         _check_quantity(product, new_quantity)
         item.quantity = new_quantity
-        item.save(update_fields=["quantity", "update_at"])
+        item.save(update_fields=["quantity", "updated_at"])
 
 @transaction.atomic
-def set_quantiy(user, slug, quantity):
-    item = (CartItem.objects.select_for_update().select_related("products").filter(cart__user=user, product__slug=slug).first)
+def set_quantity(user, slug, quantity):
+    item = (CartItem.objects.select_for_update().select_related("product").filter(cart__user=user, product__slug=slug).first())
     if item is None:
         raise NotFound("Item não está no carrinho.")
     if not item.product.is_active:
@@ -53,8 +53,8 @@ def set_quantiy(user, slug, quantity):
     item.save(update_fields=["quantity", "updated_at"])
 
 def remove_item(user, slug):
-    delated, =  CartItem.objects.filter(cart__user=user, product__slug=slug).delete()
-    if not delated:
+    deleted, _ = CartItem.objects.filter(cart__user=user, product__slug=slug).delete()
+    if not deleted:
         raise NotFound("Item não está no carrinho.")
 
 def clear_cart(user):
