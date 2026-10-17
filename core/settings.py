@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'products',
     'django_filters',
     'accounts',
+    'cart',
     'knox',
 ]
 
