@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.validators import MinValueValidator
 
-class Order(models.model):
+class Order(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "Pendente"
         PAID = "paid", "Pago"
@@ -26,7 +26,7 @@ class Order(models.model):
     shipping_state = models.CharField(max_length=2)
 
     created_at = models.DateTimeField(auto_now_add=True)
-    update_at = models.DateTimeField(auto_now=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at", "-id"]
