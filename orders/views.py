@@ -1,3 +1,31 @@
-from django.shortcuts import render
+from django.db.models import Prefetch
+from rest_framework import mixins, permissions, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
 
-# Create your views here.
+from . import services
+from .models import Order, OrderItem
+from .serializers import OrderCreateSerializer, OrderSerializer
+
+class OrderViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        items = OrderItem.objects.select_related("product")
+        qs = Order.objects.prefetch_related(Prefetch("items", queryset=items))
+        if not self.request.user.is_staff:
+            qs = qs.filter(user=self.request.user)
+        return qs
+
+    def get_serializer_class(self):
+        return OrderCreateSerializer if self.action == "create" else OrderSerializer
+
+    @action(detail=True, methods=["POST"])
+    def cancel(self, request, pk=None):
+        order = services.cancel_order(self.get_object())
+        return Response(OrderSerializer(order, context=self.get_serializer_context()).data)
