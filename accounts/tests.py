@@ -1,12 +1,32 @@
-from django.contrib.auth import get_user_model
+from datetime import timedelta
+from io import StringIO
+
+from django.apps import apps
+from django.contrib.auth import authenticate, get_user_model
 from django.core.cache import cache
+from django.core.management import CommandError, call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
+from knox.models import AuthToken
 from rest_framework.test import APITestCase
+
+from accounts.services import anonymize_user
 
 User = get_user_model()
 PASSWORD = "senha-forte-123"
+SHIPPING = {
+    "shipping_name": "Ana Silva",
+    "shipping_zip_code": "01310-100",
+    "shipping_street": "Avenida Paulista",
+    "shipping_number": "1000",
+    "shipping_complement": "",
+    "shipping_district": "Bela Vista",
+    "shipping_city": "São Paulo",
+    "shipping_state": "SP",
+}
+
 
 class UserModelTest(TestCase):
     def test_create_user_normalizes_email(self):
@@ -28,6 +48,7 @@ class UserModelTest(TestCase):
         admin = User.objects.create_superuser("root@example.com", password=PASSWORD)
         self.assertTrue(admin.is_staff)
         self.assertTrue(admin.is_superuser)
+
 
 class UserAdminTests(TestCase):
     def setUp(self):
@@ -130,3 +151,110 @@ class AuthAPITests(APITestCase):
         self.authenticate()
         self.assertEqual(self.client.post(self.logout_url).status_code, 204)
         self.assertEqual(self.client.get(self.me_url).status_code, 401)
+
+
+class AuthSecurityTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.me = reverse("auth-me")
+
+    def tearDown(self):
+        cache.clear()  # não deixa contadores de throttling vazarem para outros testes
+
+    def login(self, password=PASSWORD):
+        return self.client.post(
+            reverse("auth-login"), {"email": "ana@example.com", "password": password}, format="json"
+        )
+
+    def token(self):
+        return self.login().json()["token"]
+
+    def me_status(self, token, scheme="Token"):
+        self.client.credentials(HTTP_AUTHORIZATION=f"{scheme} {token}")
+        return self.client.get(self.me).status_code
+
+    def test_logoutall_invalidates_every_token_of_the_user(self):
+        first, second = self.token(), self.token()
+        self.assertEqual(self.me_status(first), 200)
+        self.assertEqual(self.client.post(reverse("auth-logoutall")).status_code, 204)
+        self.assertEqual(self.me_status(first), 401)
+        self.assertEqual(self.me_status(second), 401)
+
+    def test_expired_token_is_rejected(self):
+        token = self.token()
+        self.assertEqual(self.me_status(token), 200)
+        AuthToken.objects.filter(user=self.user).update(expiry=timezone.now() - timedelta(minutes=1))
+        self.assertEqual(self.me_status(token), 401)
+
+    def test_other_authorization_schemes_are_not_accepted(self):
+        self.assertEqual(self.me_status(self.token(), scheme="Bearer"), 401)
+
+    def test_garbage_token_is_rejected(self):
+        self.assertEqual(self.me_status("naoexiste"), 401)
+
+    def test_login_is_throttled_after_five_attempts_in_a_minute(self):
+        statuses = [self.login(password="errada").status_code for _ in range(6)]
+        self.assertEqual(statuses, [400, 400, 400, 400, 400, 429])
+
+    def test_register_is_throttled_after_ten_attempts_in_an_hour(self):
+        url = reverse("auth-register")
+        statuses = [
+            self.client.post(url, {"email": "x@example.com", "password": "123"}, format="json").status_code
+            for _ in range(11)
+        ]
+        self.assertEqual(statuses, [400] * 10 + [429])
+
+
+class AnonymizeUserTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD, first_name="Ana", last_name="Silva")
+
+    def test_personal_data_is_removed_and_access_is_closed(self):
+        anonymize_user(self.user)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, f"anonimo-{self.user.pk}@anonimo.invalid")
+        self.assertEqual((self.user.first_name, self.user.last_name), ("", ""))
+        self.assertFalse(self.user.is_active)
+        self.assertFalse(self.user.has_usable_password())
+        self.assertIsNone(authenticate(email="ana@example.com", password=PASSWORD))
+
+    def test_tokens_and_cart_are_removed(self):
+        Cart = apps.get_model("cart", "Cart")
+        AuthToken.objects.create(user=self.user)
+        Cart.objects.create(user=self.user)
+        anonymize_user(self.user)
+        self.assertFalse(AuthToken.objects.filter(user=self.user).exists())
+        self.assertFalse(Cart.objects.filter(user=self.user).exists())
+
+    def test_order_history_is_preserved(self):
+        order = apps.get_model("orders", "Order").objects.create(user=self.user, total="10.00", **SHIPPING)
+        anonymize_user(self.user)
+        order.refresh_from_db()
+        self.assertEqual(order.user_id, self.user.pk)
+
+    def test_original_email_can_register_again(self):
+        anonymize_user(self.user)
+        self.assertTrue(User.objects.create_user("ana@example.com", password=PASSWORD).is_active)
+
+    def test_running_it_twice_is_harmless(self):
+        anonymize_user(self.user)
+        anonymize_user(self.user)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+    def test_staff_accounts_are_refused(self):
+        staff = User.objects.create_user("staff@example.com", password=PASSWORD, is_staff=True)
+        with self.assertRaises(ValueError):
+            anonymize_user(staff)
+
+    def test_management_command(self):
+        out = StringIO()
+        call_command("anonymize_user", "ANA@example.com", stdout=out)
+        self.assertIn("Conta anonimizada", out.getvalue())
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_active)
+
+    def test_management_command_with_unknown_email(self):
+        with self.assertRaises(CommandError):
+            call_command("anonymize_user", "ninguem@example.com")
