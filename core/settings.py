@@ -10,8 +10,9 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-from pathlib import Path
+import sys
 from datetime import timedelta
+from pathlib import Path
 
 from decouple import Csv, config
 
@@ -89,8 +90,11 @@ DATABASES = {
         'NAME': config('DB_NAME'),
         'USER': config('DB_USER'),
         'PASSWORD': config('DB_PASSWORD'),
-        'HOST': config('DB_HOST', default='localhost'),
+        # IPv4 explícito: 'localhost' pode resolver para ::1, onde o Docker não publica a porta
+        'HOST': config('DB_HOST', default='127.0.0.1'),
         'PORT': config('DB_PORT', default='5432'),
+        # falha rápido (com erro claro) quando o banco está fora do ar, em vez de ficar esperando
+        'OPTIONS': {'connect_timeout': config('DB_CONNECT_TIMEOUT', default=10, cast=int)},
     }
 }
 
@@ -142,8 +146,8 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticatedOrReadOnly",
-        
     ],
+    "DEFAULT_THROTTLE_CLASSES": ["core.throttling.AnonThrottle", "core.throttling.UserThrottle"],
     "DEFAULT_THROTTLE_RATES": {"login": "5/min", "register": "10/hour"},
 }
 AUTH_USER_MODEL = 'accounts.User'
@@ -154,5 +158,38 @@ REST_KNOX = {
     "AUTO_REFRESH_MAX_TTL": timedelta(days=30),
 }
 
-PAYMENT_GATEWAY = config('PAYMENT_GATEWAY', default='fake')
+# 'fake' só é assumido em desenvolvimento; em produção o provedor precisa ser escolhido explicitamente
+PAYMENT_GATEWAY = config('PAYMENT_GATEWAY', default='fake' if DEBUG else '')
 PAYMENT_WEBHOOK_SECRET = config('PAYMENT_WEBHOOK_SECRET', default='')
+
+# Limite global de requisições (login e cadastro têm limites próprios, mais rígidos)
+THROTTLE_ANON_RATE = config('THROTTLE_ANON_RATE', default='100/min')
+THROTTLE_USER_RATE = config('THROTTLE_USER_RATE', default='300/min')
+
+# Expiração de pedidos não pagos (comando expire_pending_orders)
+ORDER_PENDING_TTL_MINUTES = config('ORDER_PENDING_TTL_MINUTES', default=60, cast=int)
+PAYMENT_WINDOW_MINUTES = config('PAYMENT_WINDOW_MINUTES', default=30, cast=int)
+PAYMENT_STALE_MINUTES = config('PAYMENT_STALE_MINUTES', default=10, cast=int)
+
+# --- Produção (com DEBUG=False os padrões abaixo são os seguros; tudo pode ser sobrescrito no ambiente) ---
+SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=not DEBUG, cast=bool)
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
+CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
+SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=0 if DEBUG else 3600, cast=int)
+if config('BEHIND_PROXY', default=False, cast=bool):
+    # só ative atrás de um proxy/balanceador que remove esse cabeçalho vindo de fora
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {'simple': {'format': '{asctime} {levelname} {name} {message}', 'style': '{'}},
+    'handlers': {'console': {'class': 'logging.StreamHandler', 'formatter': 'simple'}},
+    'root': {'handlers': ['console'], 'level': config('LOG_LEVEL', default='INFO')},
+}
+
+# Testes: hash de senha rápido (o PBKDF2 padrão deixa a suíte lenta e não é o que está sendo testado)
+if sys.argv[1:2] == ['test']:
+    PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
