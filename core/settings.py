@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'products',
     'orders',
+    'payments',
     'django_filters',
     'accounts',
     'cart',
@@ -152,3 +153,6 @@ REST_KNOX = {
     "AUTO_REFRESH": True,
     "AUTO_REFRESH_MAX_TTL": timedelta(days=30),
 }
+
+PAYMENT_GATEWAY = config('PAYMENT_GATEWAY', default='fake')
+PAYMENT_WEBHOOK_SECRET = config('PAYMENT_WEBHOOK_SECRET', default='')

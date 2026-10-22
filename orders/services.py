@@ -78,4 +78,6 @@ def cancel_order(order):
 
     order.status = Order.Status.CANCELLED
     order.save(update_fields=["status", "updated_at"])
+        # um pagamento ainda pendente deste pedido deixa de valer
+    order.payments.filter(status="pending").update(status="cancelled", updated_at=timezone.now())
     return order

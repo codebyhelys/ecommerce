@@ -17,9 +17,12 @@ class Payment(models.Model):
 
     order = models.ForeignKey("orders.Order", on_delete=models.PROTECT, related_name="payments")
     provider = models.CharField(max_length=30)
-    method = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
-
+    method = models.CharField(max_length=10, choices=Method.choices)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    # valor congelado na criação: o webhook precisa bater com ele
     amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    provider_reference = models.CharField(max_length=100, blank=True)
+    # só dados que o cliente pode ver (ex.: código Pix copia-e-cola, link de checkout)
     payment_data = models.JSONField(default=dict, blank=True)
     # pago depois de o pedido ter sido cancelado: alguém precisa devolver o dinheiro
     needs_refund = models.BooleanField(default=False)
@@ -28,7 +31,7 @@ class Payment(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-created_at", "id"]
+        ordering = ["-created_at", "-id"]
         constraints = [
             # no máximo UM pagamento ativo (pendente ou aprovado) por pedido: impede cobrança em duplicidade
             models.UniqueConstraint(
