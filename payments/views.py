@@ -12,7 +12,7 @@ class PaymentViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = PaymentSerializer 
 
-    def queryset(self):
+    def get_queryset(self):
         qs = Payment.objects.all()
         if not self.request.user.is_staff:
             qs = qs.filter(order__user=self.request.user)
@@ -23,7 +23,7 @@ class PaymentViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         serializer.is_valid(raise_exception=True)
         payment = services.start_payment(
             user = request.user,
-            order_id=serializer.validate_data["order"],
+            order_id=serializer.validated_data["order"],
             method=serializer.validated_data["method"],
         )
         return Response(PaymentSerializer(payment).data, status=status.HTTP_201_CREATED)

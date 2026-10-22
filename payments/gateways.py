@@ -66,11 +66,11 @@ class FakeGateway:
             raise InvalidWebhook("status desconhecido")
         return event
 
-GATEWAYS = {"fake", FakeGateway}
+GATEWAYS = {"fake": FakeGateway}
 
 def get_gateway(name=None):
     if name is None:
-        name = settings.PAYMENT_GATEWAYS
+        name = settings.PAYMENT_GATEWAY
         if name not in GATEWAYS:
             raise ImproperlyConfigured(f"PAYMENT_GATEWAY inválido: {name!r}")
     try:
