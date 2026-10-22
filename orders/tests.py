@@ -1,18 +1,24 @@
 import threading
+from datetime import timedelta
 from decimal import Decimal
+from io import StringIO
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.db import connection
-from django.test import TransactionTestCase
+from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
 from cart.models import Cart
 from cart.services import add_item
+from payments.models import Payment
 from products.models import Category, Product
 
 from .models import Order
+from .services import InvalidOrderState, create_order, deliver_order, expire_pending_orders, ship_order
 
 User = get_user_model()
 PASSWORD = "Senha-forte-123"
@@ -241,3 +247,158 @@ class OrderConcurrencyTests(TransactionTestCase):
         shirt.refresh_from_db()
         self.assertEqual(shirt.stock, 3)  # baixou uma vez só
         self.assertEqual(Order.objects.count(), 1)
+
+
+class ExpirationTests(TestCase):
+    """Pedidos que ninguém paga não podem segurar o estoque para sempre."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.shirt, _ = make_catalog()  # estoque inicial: 5
+
+    def make_order(self, minutes_old=0):
+        add_item(self.user, "camiseta", 2)
+        order = create_order(user=self.user, shipping=SHIPPING)
+        Order.objects.filter(pk=order.pk).update(created_at=timezone.now() - timedelta(minutes=minutes_old))
+        return order
+
+    def add_payment(self, order, minutes_old, reference="ref_1"):
+        payment = Payment.objects.create(
+            order=order, provider="fake", method="pix", amount=order.total, provider_reference=reference
+        )
+        Payment.objects.filter(pk=payment.pk).update(created_at=timezone.now() - timedelta(minutes=minutes_old))
+        return payment
+
+    def status(self, order):
+        order.refresh_from_db()
+        return order.status
+
+    def test_old_pending_order_is_cancelled_and_stock_returns(self):
+        order = self.make_order(minutes_old=120)
+        self.shirt.refresh_from_db()
+        self.assertEqual(self.shirt.stock, 3)
+        self.assertEqual(expire_pending_orders(), (1, 0))
+        self.assertEqual(self.status(order), "cancelled")
+        self.shirt.refresh_from_db()
+        self.assertEqual(self.shirt.stock, 5)
+
+    def test_recent_pending_order_is_left_alone(self):
+        order = self.make_order(minutes_old=10)
+        self.assertEqual(expire_pending_orders(), (0, 0))
+        self.assertEqual(self.status(order), "pending")
+
+    def test_order_with_a_payment_still_in_progress_is_left_alone(self):
+        order = self.make_order(minutes_old=120)
+        self.add_payment(order, minutes_old=5)  # Pix gerado há 5 min, ainda válido
+        self.assertEqual(expire_pending_orders(), (0, 0))
+        self.assertEqual(self.status(order), "pending")
+
+    def test_order_whose_payment_window_has_passed_expires_and_the_payment_is_cancelled(self):
+        order = self.make_order(minutes_old=120)
+        payment = self.add_payment(order, minutes_old=45)
+        self.assertEqual(expire_pending_orders(), (1, 0))
+        self.assertEqual(self.status(order), "cancelled")
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, "cancelled")
+
+    def test_paid_orders_are_never_expired(self):
+        order = self.make_order(minutes_old=500)
+        Order.objects.filter(pk=order.pk).update(status="paid")
+        self.assertEqual(expire_pending_orders(), (0, 0))
+        self.assertEqual(self.status(order), "paid")
+
+    def test_payment_never_sent_to_the_provider_is_released_so_the_order_can_expire(self):
+        order = self.make_order(minutes_old=120)
+        payment = self.add_payment(order, minutes_old=30, reference="")  # caiu entre criar e chamar o provedor
+        self.assertEqual(expire_pending_orders(), (1, 1))
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, "failed")
+        self.assertEqual(self.status(order), "cancelled")
+
+    def test_management_command_reports_what_it_did(self):
+        self.make_order(minutes_old=120)
+        out = StringIO()
+        call_command("expire_pending_orders", stdout=out)
+        self.assertIn("1 pedido(s) expirado(s)", out.getvalue())
+
+
+class OrderStatusTransitionTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()
+        add_item(self.user, "camiseta", 1)
+        self.order = create_order(user=self.user, shipping=SHIPPING)
+
+    def set_status(self, status):
+        Order.objects.filter(pk=self.order.pk).update(status=status)
+
+    def test_full_lifecycle(self):
+        self.set_status("paid")
+        self.assertEqual(ship_order(self.order).status, "shipped")
+        self.assertEqual(deliver_order(self.order).status, "delivered")
+
+    def test_cannot_ship_an_unpaid_order(self):
+        with self.assertRaises(InvalidOrderState):
+            ship_order(self.order)
+
+    def test_cannot_deliver_before_shipping(self):
+        self.set_status("paid")
+        with self.assertRaises(InvalidOrderState):
+            deliver_order(self.order)
+
+
+class OrderAdminTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser("root@example.com", password=PASSWORD)
+        self.client.force_login(self.admin)
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.shirt, _ = make_catalog()
+        self.changelist = reverse("admin:orders_order_changelist")
+
+    def new_order(self, status="pending"):
+        add_item(self.user, "camiseta", 1)
+        order = create_order(user=self.user, shipping=SHIPPING)
+        Order.objects.filter(pk=order.pk).update(status=status)
+        return order
+
+    def run_action(self, action, *orders):
+        data = {"action": action, "_selected_action": [o.pk for o in orders]}
+        return self.client.post(self.changelist, data, follow=True)
+
+    def status(self, order):
+        order.refresh_from_db()
+        return order.status
+
+    def test_status_cannot_be_edited_by_hand(self):
+        order = self.new_order()
+        url = reverse("admin:orders_order_change", args=[order.pk])
+        self.assertNotContains(self.client.get(url), 'name="status"')
+        self.client.post(url, {"status": "cancelled"})
+        self.assertEqual(self.status(order), "pending")
+
+    def test_orders_cannot_be_deleted_in_admin(self):
+        order = self.new_order()
+        response = self.client.get(reverse("admin:orders_order_delete", args=[order.pk]))
+        self.assertEqual(response.status_code, 403)
+
+    def test_ship_action_only_moves_paid_orders(self):
+        paid, pending = self.new_order("paid"), self.new_order("pending")
+        self.run_action("mark_shipped", paid, pending)
+        self.assertEqual(self.status(paid), "shipped")
+        self.assertEqual(self.status(pending), "pending")
+
+    def test_deliver_action_only_moves_shipped_orders(self):
+        shipped, paid = self.new_order("shipped"), self.new_order("paid")
+        self.run_action("mark_delivered", shipped, paid)
+        self.assertEqual(self.status(shipped), "delivered")
+        self.assertEqual(self.status(paid), "paid")
+
+    def test_cancel_action_returns_stock_and_ignores_paid_orders(self):
+        pending, paid = self.new_order("pending"), self.new_order("paid")
+        self.shirt.refresh_from_db()
+        stock_before = self.shirt.stock
+        self.run_action("cancel_orders", pending, paid)
+        self.assertEqual(self.status(pending), "cancelled")
+        self.assertEqual(self.status(paid), "paid")
+        self.shirt.refresh_from_db()
+        self.assertEqual(self.shirt.stock, stock_before + 1)
