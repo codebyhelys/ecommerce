@@ -5,8 +5,9 @@ import threading
 from unittest import mock
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
-from django.test import TransactionTestCase, override_settings
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient, APITestCase
 
@@ -15,16 +16,22 @@ from orders.models import Order
 from orders.services import cancel_order, create_order
 from products.models import Category, Product
 
-from .gateways import FakeGateway
+from .checks import fake_gateway_in_production
+from .gateways import FakeGateway, get_gateway
 from .models import Payment, WebhookEvent
 
 User = get_user_model()
 PASSWORD = "Senha-forte-123"
 SECRET = "segredo-de-teste"
 SHIPPING = {
-    "shipping_name": "Ana Silva", "shipping_zip_code": "01310-100", "shipping_street": "Avenida Paulista",
-    "shipping_number": "1000", "shipping_complement": "", "shipping_district": "Bela Vista",
-    "shipping_city": "São Paulo", "shipping_state": "SP",
+    "shipping_name": "Ana Silva",
+    "shipping_zip_code": "01310-100",
+    "shipping_street": "Avenida Paulista",
+    "shipping_number": "1000",
+    "shipping_complement": "",
+    "shipping_district": "Bela Vista",
+    "shipping_city": "São Paulo",
+    "shipping_state": "SP",
 }
 
 
@@ -42,14 +49,27 @@ def sign(body):
     return hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
 
 
-def send_event(client, reference, status="approved", event_id="evt_1", amount=None, signature=None, provider="fake"):
+def send_event(
+    client,
+    reference,
+    status="approved",
+    event_id="evt_1",
+    amount=None,
+    signature=None,
+    provider="fake",
+    payment_id=None,
+):
     payload = {"event_id": event_id, "reference": reference, "status": status}
     if amount is not None:
         payload["amount"] = str(amount)
+    if payment_id is not None:
+        payload["payment_id"] = payment_id
     body = json.dumps(payload).encode()
     return client.post(
         reverse("payment-webhook", kwargs={"provider": provider}),
-        data=body, content_type="application/json", HTTP_X_SIGNATURE=signature or sign(body),
+        data=body,
+        content_type="application/json",
+        HTTP_X_SIGNATURE=signature or sign(body),
     )
 
 
@@ -170,17 +190,39 @@ class WebhookTests(APITestCase):
         body = b"isto nao e json"
         response = self.provider.post(
             reverse("payment-webhook", kwargs={"provider": "fake"}),
-            data=body, content_type="application/json", HTTP_X_SIGNATURE=sign(body),
+            data=body,
+            content_type="application/json",
+            HTTP_X_SIGNATURE=sign(body),
         )
         self.assertEqual(response.status_code, 400)
 
     def test_unknown_provider_is_404(self):
         self.assertEqual(send_event(self.provider, self.reference, provider="outro").status_code, 404)
 
-    def test_unknown_reference_is_ignored(self):
+    def test_unknown_reference_is_not_recorded_so_the_provider_can_retry(self):
         response = send_event(self.provider, "fake_inexistente")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ignored"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"status": "unmatched"})
+        self.assertEqual(WebhookEvent.objects.count(), 0)
+
+    def test_event_that_arrives_before_the_reference_is_saved_is_processed_on_retry(self):
+        # corrida: o provedor avisa antes de gravarmos a referência dele
+        Payment.objects.filter(pk=self.payment_id).update(provider_reference="")
+        self.assertEqual(send_event(self.provider, self.reference).status_code, 404)
+        Payment.objects.filter(pk=self.payment_id).update(provider_reference=self.reference)
+        retry = send_event(self.provider, self.reference)  # mesmo event_id
+        self.assertEqual(retry.json(), {"status": "processed"})
+        self.assertEqual(self.refresh().status, "approved")
+        self.assertEqual(self.order.status, Order.Status.PAID)
+
+    def test_event_is_matched_by_our_payment_id_when_the_reference_is_still_missing(self):
+        Payment.objects.filter(pk=self.payment_id).update(provider_reference="")
+        response = send_event(self.provider, self.reference, payment_id=self.payment_id)
+        self.assertEqual(response.json(), {"status": "processed"})
+        payment = self.refresh()
+        self.assertEqual(payment.status, "approved")
+        self.assertEqual(payment.provider_reference, self.reference)
+        self.assertEqual(self.order.status, Order.Status.PAID)
 
     def test_failed_event_keeps_order_pending(self):
         send_event(self.provider, self.reference, status="failed")
@@ -264,3 +306,23 @@ class PaymentConcurrencyTests(TransactionTestCase):
         self.assertEqual(WebhookEvent.objects.count(), 1)
         order.refresh_from_db()
         self.assertEqual(order.status, Order.Status.PAID)
+
+
+class GatewayConfigurationTests(SimpleTestCase):
+    @override_settings(PAYMENT_GATEWAY="")
+    def test_missing_gateway_fails_loudly(self):
+        with self.assertRaises(ImproperlyConfigured):
+            get_gateway()
+
+    @override_settings(PAYMENT_GATEWAY="inexistente")
+    def test_unknown_gateway_fails_loudly(self):
+        with self.assertRaises(ImproperlyConfigured):
+            get_gateway()
+
+    @override_settings(DEBUG=False, PAYMENT_GATEWAY="fake")
+    def test_deploy_check_rejects_the_fake_gateway_in_production(self):
+        self.assertEqual([e.id for e in fake_gateway_in_production(None)], ["payments.E001"])
+
+    @override_settings(DEBUG=True, PAYMENT_GATEWAY="fake")
+    def test_deploy_check_allows_the_fake_gateway_in_development(self):
+        self.assertEqual(fake_gateway_in_production(None), [])

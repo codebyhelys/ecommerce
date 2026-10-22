@@ -10,24 +10,31 @@ from django.core.exceptions import ImproperlyConfigured
 
 VALID_STATUSES = {"approved", "failed", "cancelled", "pending"}
 
+
 class InvalidWebhook(Exception):
-     """Assinatura inválida ou corpo mal formado."""
+    """Assinatura inválida ou corpo mal formado."""
+
 
 class UnknownGateway(Exception):
-     pass
+    pass
+
 
 @dataclass
 class GatewayResult:
-     reference : str
-     data: dict = field(default_factory=dict)
+    reference: str
+    data: dict = field(default_factory=dict)
 
-@dataclass 
+
+@dataclass
 class GatewayEvent:
-    event_id : str
+    event_id: str
     reference: str
     status: str
     amount: Decimal | None = None
+    # id do nosso Payment, quando o provedor o devolve (ex.: external_reference no Mercado Pago)
+    payment_id: int | None = None
     raw: dict = field(default_factory=dict)
+
 
 class FakeGateway:
     """Provedor de mentira para desenvolvimento e testes. NÃO use em produção."""
@@ -53,27 +60,33 @@ class FakeGateway:
         try:
             payload = json.loads(body)
             amount = payload.get("amount")
+            payment_id = payload.get("payment_id")
             event = GatewayEvent(
                 event_id=str(payload["event_id"]),
                 reference=str(payload["reference"]),
                 status=str(payload["status"]),
                 amount=Decimal(str(amount)) if amount is not None else None,
+                payment_id=int(payment_id) if payment_id is not None else None,
                 raw=payload,
             )
         except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
-            raise InvalidWebhook("payload inválido")
+            raise InvalidWebhook("payload inválido") from None
         if event.status not in VALID_STATUSES:
             raise InvalidWebhook("status desconhecido")
         return event
 
+
 GATEWAYS = {"fake": FakeGateway}
+
 
 def get_gateway(name=None):
     if name is None:
         name = settings.PAYMENT_GATEWAY
         if name not in GATEWAYS:
-            raise ImproperlyConfigured(f"PAYMENT_GATEWAY inválido: {name!r}")
+            raise ImproperlyConfigured(
+                f"PAYMENT_GATEWAY inválido ou não definido: {name!r}. Opções: {', '.join(GATEWAYS)}."
+            )
     try:
         return GATEWAYS[name]()
     except KeyError:
-        raise UnknownGateway(name)
+        raise UnknownGateway(name) from None

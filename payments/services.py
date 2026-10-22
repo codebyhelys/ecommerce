@@ -45,18 +45,21 @@ def start_payment(*, user, order_id, method):
         if order.payments.filter(status__in=[Payment.Status.PENDING, Payment.Status.APPROVED]).exists():
             raise PaymentConflict("Já existe um pagamento em andamento para este pedido.")
         payment = Payment.objects.create(
-            order=order, provider=gateway.name, method=method, amount=order.total,
+            order=order,
+            provider=gateway.name,
+            method=method,
+            amount=order.total,
         )
 
     # 2) chama o provedor FORA da transação: rede lenta não segura trava no banco
     try:
         result = gateway.create_payment(payment)
-    except Exception:
+    except Exception as exc:
         logger.exception("Falha ao criar pagamento %s no provedor %s", payment.pk, gateway.name)
         Payment.objects.filter(pk=payment.pk).update(
             status=Payment.Status.FAILED, updated_at=timezone.now()
         )  # libera a vaga para uma nova tentativa
-        raise GatewayUnavailable()
+        raise GatewayUnavailable() from exc
 
     payment.provider_reference = result.reference
     payment.payment_data = result.data
@@ -65,7 +68,11 @@ def start_payment(*, user, order_id, method):
 
 
 def handle_webhook(provider, headers, body):
-    """Devolve 'processed', 'duplicate' ou 'ignored'. Levanta InvalidWebhook / UnknownGateway."""
+    """Devolve 'processed', 'duplicate', 'ignored' ou 'unmatched'. Levanta InvalidWebhook / UnknownGateway.
+
+    'unmatched' = nenhum pagamento nosso corresponde ao evento (ex.: o provedor avisou antes de gravarmos a
+    referência). O registro do evento é desfeito para que a reentrega do provedor possa ser processada.
+    """
     gateway = get_gateway(provider)
     event = gateway.parse_webhook(headers, body)  # verifica a assinatura ANTES de tudo
 
@@ -75,18 +82,23 @@ def handle_webhook(provider, headers, body):
                 WebhookEvent.objects.create(provider=gateway.name, event_id=event.event_id, payload=event.raw)
         except IntegrityError:
             return "duplicate"
-        return _apply_event(gateway.name, event)
+        outcome = _apply_event(gateway.name, event)
+        if outcome == "unmatched":
+            transaction.set_rollback(True)  # não grava o evento: senão a reentrega viraria 'duplicate'
+        return outcome
 
 
 def _apply_event(provider, event):
-    payment = (
-        Payment.objects.select_for_update()
-        .filter(provider=provider, provider_reference=event.reference)
-        .first()
-    )
+    candidates = Payment.objects.select_for_update().filter(provider=provider)
+    payment = candidates.filter(provider_reference=event.reference).first()
+    if payment is None and event.payment_id is not None:
+        # o provedor avisou antes de gravarmos a referência dele: casa pelo id do nosso pagamento
+        payment = candidates.filter(pk=event.payment_id).first()
+        if payment is not None and not payment.provider_reference:
+            payment.provider_reference = event.reference
     if payment is None:
-        logger.warning("Webhook %s para referência desconhecida %s", event.event_id, event.reference)
-        return "ignored"
+        logger.warning("Webhook %s sem pagamento correspondente (referência %s)", event.event_id, event.reference)
+        return "unmatched"
 
     if event.amount is not None and event.amount != payment.amount:
         logger.warning("Webhook %s com valor divergente (%s != %s)", event.event_id, event.amount, payment.amount)
@@ -105,6 +117,8 @@ def _apply_event(provider, event):
             order.save(update_fields=["status", "updated_at"])
         else:
             payment.needs_refund = True
-            logger.error("Pagamento %s aprovado para pedido %s em estado %s: estornar", payment.pk, order.pk, order.status)
+            logger.error(
+                "Pagamento %s aprovado para pedido %s em estado %s: estornar", payment.pk, order.pk, order.status
+            )
     payment.save()
     return "processed"
