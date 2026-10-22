@@ -4,8 +4,14 @@ from . import services
 from .models import Order, OrderItem
 
 SHIPPING_FIELDS = [
-    "shipping_name", "shipping_zip_code", "shipping_street", "shipping_number",
-    "shipping_complement", "shipping_district", "shipping_city", "shipping_state",
+    "shipping_name",
+    "shipping_zip_code",
+    "shipping_street",
+    "shipping_number",
+    "shipping_complement",
+    "shipping_district",
+    "shipping_city",
+    "shipping_state",
 ]
 
 

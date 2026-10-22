@@ -4,12 +4,14 @@ from rest_framework.throttling import ScopedRateThrottle
 
 from .serializers import LoginSerializer, RegisterSerializer, UserSerializer
 
+
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "register"
+
 
 class LoginView(KnoxLoginView):
     permission_classes = [permissions.AllowAny]

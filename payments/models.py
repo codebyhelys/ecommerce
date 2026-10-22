@@ -1,7 +1,8 @@
+from decimal import Decimal
+
+from django.core.validators import MinValueValidator
 from django.db import models
 
-from decimal import Decimal
-from django.core.validators import MinValueValidator
 
 class Payment(models.Model):
     class Method(models.TextChoices):
@@ -48,6 +49,7 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"Pagamento #{self.pk} ({self.get_status_display()})"
+
 
 class WebhookEvent(models.Model):
     provider = models.CharField(max_length=30)

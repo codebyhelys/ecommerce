@@ -4,10 +4,14 @@ from django.contrib.auth.forms import AdminUserCreationForm
 
 from .models import User
 
+
 class UserCreationForm(AdminUserCreationForm):
     class Meta:
         model = User
-        fields = ["email",]
+        fields = [
+            "email",
+        ]
+
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
@@ -21,6 +25,4 @@ class UserAdmin(BaseUserAdmin):
         ("Permissões", {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")}),
         ("Datas", {"fields": ("last_login", "date_joined")}),
     )
-    add_fieldsets = (
-        (None, {"classes": ("wide",), "fields": ("email", "usable_password", "password1", "password2")}),
-    )
+    add_fieldsets = ((None, {"classes": ("wide",), "fields": ("email", "usable_password", "password1", "password2")}),)

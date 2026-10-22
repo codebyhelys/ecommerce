@@ -1,13 +1,14 @@
-from django.db import models
 from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
 from django.db.models.functions import Lower
+
 
 class UserManager(BaseUserManager):
     use_in_migrations = True
 
     def _create_user(self, email, password, **extra_fields):
         if not email:
-            raise ValueError("o email é obrigatorio")
+            raise ValueError("O e-mail é obrigatório.")
         email = self.normalize_email(email).lower()
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
@@ -27,6 +28,7 @@ class UserManager(BaseUserManager):
         if extra_fields["is_superuser"] is not True:
             raise ValueError("Superusuário precisa de is_superuser=True.")
         return self._create_user(email, password, **extra_fields)
+
 
 class User(AbstractUser):
     username = None

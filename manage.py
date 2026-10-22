@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Django's command-line utility for administrative tasks."""
+
 import os
 import sys
 
@@ -19,6 +20,7 @@ def main():
         # porta padrão do servidor de desenvolvimento, configurável no .env
         from decouple import config
         from django.core.management.commands.runserver import Command as RunserverCommand
+
         RunserverCommand.default_port = str(config('DEV_SERVER_PORT', default='8010'))
     execute_from_command_line(sys.argv)
 

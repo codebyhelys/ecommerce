@@ -1,8 +1,9 @@
-from django.db import models
 from decimal import Decimal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator
+from django.db import models
+
 
 class Order(models.Model):
     class Status(models.TextChoices):
@@ -35,6 +36,7 @@ class Order(models.Model):
     def __str__(self):
         return f"Pedido #{self.pk}"
 
+
 class OrderItem(models.Model):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items")
     product = models.ForeignKey("products.Product", on_delete=models.PROTECT, related_name="order_items")
@@ -49,9 +51,9 @@ class OrderItem(models.Model):
             models.UniqueConstraint(fields=["order", "product"], name="orderitem_unique_product_per_order"),
         ]
 
+    def __str__(self):
+        return f"{self.quantity} x {self.product_name}"
+
     @property
     def subtotal(self):
         return self.unit_price * self.quantity
-
-    def __str__(self):
-        return f"{self.quantity} x {self.product_name}"

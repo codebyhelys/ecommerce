@@ -76,7 +76,9 @@ class CartAPITests(APITestCase):
         self.add("camiseta", 2)
         self.client.force_authenticate(self.other)
         self.assertEqual(self.client.get(self.cart_url).json()["items"], [])
-        self.assertEqual(self.client.patch(self.detail_url("camiseta"), {"quantity": 1}, format="json").status_code, 404)
+        self.assertEqual(
+            self.client.patch(self.detail_url("camiseta"), {"quantity": 1}, format="json").status_code, 404
+        )
 
     # --- adicionar ---
     def test_add_item(self):

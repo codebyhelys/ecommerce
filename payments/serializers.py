@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from .models import Payment
 
+
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
@@ -9,9 +10,9 @@ class PaymentSerializer(serializers.ModelSerializer):
 
         read_only_fields = fields
 
+
 class PaymentCreateSerializer(serializers.Serializer):
     """O cliente escolhe só o pedido e o método; valor e status são do servidor."""
 
     order = serializers.IntegerField(min_value=1)
     method = serializers.ChoiceField(choices=Payment.Method.choices)
-    
