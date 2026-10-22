@@ -1,6 +1,6 @@
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
-from rest_framework import permissions, status, viewsets
+from rest_framework import status, viewsets
 from rest_framework.exceptions import APIException
 
 from .filters import ProductFilter
@@ -11,16 +11,12 @@ from .serializers import CategorySerializer, ProductSerializer
 
 class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
+    permission_classes = [IsAdminOrReadOnly]
     lookup_field = "slug"
     filterset_class = ProductFilter
     search_fields = ["name", "description"]
     ordering_fields = ["price", "created_at", "name"]
     ordering = ["-created_at"]
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [permissions.AllowAny()]
-        return [permissions.IsAdminUser()]
 
     def get_queryset(self):
         qs = Product.objects.select_related("category")
@@ -47,12 +43,12 @@ class CategoryViewSet(viewsets.ModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        return Category.objects.annotate(
-            products_count=Count("products", filter=Q(products__is_active=True))
-        ).order_by("name")
+        return Category.objects.annotate(products_count=Count("products", filter=Q(products__is_active=True))).order_by(
+            "name"
+        )
 
     def perform_destroy(self, instance):
         try:
             instance.delete()
         except ProtectedError:
-            raise CategoryInUse()
+            raise CategoryInUse() from None
