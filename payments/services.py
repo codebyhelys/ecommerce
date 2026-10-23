@@ -5,6 +5,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import APIException, NotFound
 
+from orders.emails import send_order_email
 from orders.models import Order
 
 from .gateways import get_gateway
@@ -24,6 +25,12 @@ class PaymentConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_detail = "Não é possível iniciar o pagamento deste pedido."
     default_code = "payment_conflict"
+
+
+class RefundNotPending(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "Este pagamento não está aguardando estorno."
+    default_code = "refund_not_pending"
 
 
 class GatewayUnavailable(APIException):
@@ -115,6 +122,7 @@ def _apply_event(provider, event):
         if order.status == Order.Status.PENDING:
             order.status = Order.Status.PAID
             order.save(update_fields=["status", "updated_at"])
+            transaction.on_commit(lambda: send_order_email(order, "paid"))
         else:
             payment.needs_refund = True
             logger.error(
@@ -122,3 +130,16 @@ def _apply_event(provider, event):
             )
     payment.save()
     return "processed"
+
+
+@transaction.atomic
+def mark_refunded(payment):
+    """Registra que o dinheiro JÁ foi devolvido ao cliente (a devolução em si é feita no provedor)."""
+    payment = Payment.objects.select_for_update().get(pk=payment.pk)
+    if payment.status != Payment.Status.APPROVED or not payment.needs_refund:
+        raise RefundNotPending()
+    payment.status = Payment.Status.REFUNDED
+    payment.needs_refund = False
+    payment.refunded_at = timezone.now()
+    payment.save(update_fields=["status", "needs_refund", "refunded_at", "updated_at"])
+    return payment

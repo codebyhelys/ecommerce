@@ -15,6 +15,7 @@ class Payment(models.Model):
         APPROVED = "approved", "Aprovado"
         FAILED = "failed", "Recusado"
         CANCELLED = "cancelled", "Cancelado"
+        REFUNDED = "refunded", "Estornado"
 
     order = models.ForeignKey("orders.Order", on_delete=models.PROTECT, related_name="payments")
     provider = models.CharField(max_length=30)
@@ -27,6 +28,7 @@ class Payment(models.Model):
     payment_data = models.JSONField(default=dict, blank=True)
     # pago depois de o pedido ter sido cancelado: alguém precisa devolver o dinheiro
     needs_refund = models.BooleanField(default=False)
+    refunded_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

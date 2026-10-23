@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, connection, transaction
+from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework.test import APITestCase
@@ -181,3 +182,33 @@ class CartAPITests(APITestCase):
         with CaptureQueriesContext(connection) as queries:
             self.client.get(self.cart_url)
         self.assertLessEqual(len(queries), 2)
+
+
+@override_settings(SHIPPING_FLAT_RATE=Decimal("19.90"), SHIPPING_FREE_ABOVE=Decimal("100.00"))
+class CartShippingEstimateTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        category = Category.objects.create(name="Camisetas", slug="camisetas")
+        Product.objects.create(
+            name="Camiseta", slug="camiseta", description="d", price=Decimal("49.90"), stock=10, category=category
+        )
+        self.client.force_authenticate(self.user)
+
+    def add(self, quantity):
+        self.client.post(reverse("cart-item-add"), {"product": "camiseta", "quantity": quantity}, format="json")
+
+    def test_estimate_charges_shipping_below_the_threshold(self):
+        self.add(1)
+        body = self.client.get(reverse("cart")).json()
+        self.assertEqual(
+            (body["total"], body["shipping_estimate"], body["estimated_total"]), ("49.90", "19.90", "69.80")
+        )
+
+    def test_estimate_is_free_above_the_threshold(self):
+        self.add(3)
+        body = self.client.get(reverse("cart")).json()
+        self.assertEqual((body["shipping_estimate"], body["estimated_total"]), ("0.00", "149.70"))
+
+    def test_empty_cart_has_no_shipping(self):
+        body = self.client.get(reverse("cart")).json()
+        self.assertEqual((body["shipping_estimate"], body["estimated_total"]), ("0.00", "0.00"))

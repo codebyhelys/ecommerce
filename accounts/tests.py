@@ -1,17 +1,20 @@
+import re
 from datetime import timedelta
 from io import StringIO
 
 from django.apps import apps
 from django.contrib.auth import authenticate, get_user_model
+from django.core import mail
 from django.core.cache import cache
 from django.core.management import CommandError, call_command
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from knox.models import AuthToken
 from rest_framework.test import APITestCase
 
+from accounts.models import Address
 from accounts.services import anonymize_user
 
 User = get_user_model()
@@ -258,3 +261,233 @@ class AnonymizeUserTests(TestCase):
     def test_management_command_with_unknown_email(self):
         with self.assertRaises(CommandError):
             call_command("anonymize_user", "ninguem@example.com")
+
+
+ADDRESS = {
+    "recipient_name": "Ana Silva",
+    "zip_code": "01310100",
+    "street": "Avenida Paulista",
+    "number": "1000",
+    "complement": "apto 12",
+    "district": "Bela Vista",
+    "city": "São Paulo",
+    "state": "sp",
+}
+
+
+class AddressAPITests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.other = User.objects.create_user("beto@example.com", password=PASSWORD)
+        self.client.force_authenticate(self.user)
+        self.url = reverse("address-list")
+
+    def create(self, **extra):
+        return self.client.post(self.url, {**ADDRESS, **extra}, format="json")
+
+    def detail(self, pk):
+        return reverse("address-detail", kwargs={"pk": pk})
+
+    def test_requires_authentication(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(self.url).status_code, 401)
+
+    def test_create_normalizes_and_first_address_becomes_default(self):
+        response = self.create()
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual((body["zip_code"], body["state"]), ("01310-100", "SP"))
+        self.assertTrue(body["is_default"])
+
+    def test_second_address_is_not_default_unless_requested(self):
+        first = self.create().json()
+        second = self.create(street="Rua Augusta").json()
+        self.assertFalse(second["is_default"])
+        third = self.create(street="Rua Oscar Freire", is_default=True).json()
+        self.assertTrue(third["is_default"])
+        self.assertFalse(Address.objects.get(pk=first["id"]).is_default)
+        self.assertEqual(Address.objects.filter(user=self.user, is_default=True).count(), 1)
+
+    def test_list_shows_only_own_addresses(self):
+        self.create()
+        Address.objects.create(user=self.other, **{**ADDRESS, "state": "RJ"})
+        listing = self.client.get(self.url).json()
+        self.assertEqual(len(listing), 1)
+
+    def test_cannot_touch_someone_elses_address(self):
+        theirs = Address.objects.create(user=self.other, **{**ADDRESS, "state": "RJ"})
+        self.assertEqual(self.client.get(self.detail(theirs.pk)).status_code, 404)
+        self.assertEqual(self.client.patch(self.detail(theirs.pk), {"city": "X"}, format="json").status_code, 404)
+        self.assertEqual(self.client.delete(self.detail(theirs.pk)).status_code, 404)
+
+    def test_update_fields(self):
+        pk = self.create().json()["id"]
+        response = self.client.patch(self.detail(pk), {"number": "2000", "label": "Casa"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((response.json()["number"], response.json()["label"]), ("2000", "Casa"))
+
+    def test_the_default_cannot_be_unset_directly(self):
+        pk = self.create().json()["id"]
+        response = self.client.patch(self.detail(pk), {"is_default": False}, format="json")
+        self.assertTrue(response.json()["is_default"])
+
+    def test_deleting_the_default_promotes_another_address(self):
+        first = self.create().json()["id"]
+        second = self.create(street="Rua Augusta").json()["id"]
+        self.assertEqual(self.client.delete(self.detail(first)).status_code, 204)
+        self.assertTrue(Address.objects.get(pk=second).is_default)
+
+    def test_address_limit_per_account(self):
+        for i in range(Address.MAX_PER_USER):
+            self.assertEqual(self.create(number=str(i)).status_code, 201)
+        self.assertEqual(self.create(number="99").status_code, 400)
+
+    def test_invalid_zip_and_state_are_rejected(self):
+        self.assertEqual(self.create(zip_code="123").status_code, 400)
+        self.assertEqual(self.create(state="Sao").status_code, 400)
+
+    def test_anonymizing_the_account_removes_its_addresses(self):
+        self.create()
+        anonymize_user(self.user)
+        self.assertFalse(Address.objects.filter(user=self.user).exists())
+
+
+@override_settings(FRONTEND_URL="https://loja.example.com")
+class PasswordTests(APITestCase):
+    NEW = "Outra-senha-forte-456"
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.change_url = reverse("auth-password-change")
+        self.reset_url = reverse("auth-password-reset")
+        self.confirm_url = reverse("auth-password-reset-confirm")
+
+    def tearDown(self):
+        cache.clear()
+
+    def login(self, password):
+        return self.client.post(
+            reverse("auth-login"), {"email": "ana@example.com", "password": password}, format="json"
+        )
+
+    def token(self):
+        return self.login(PASSWORD).json()["token"]
+
+    def credentials(self, token):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token}")
+
+    def reset_link_parts(self):
+        body = mail.outbox[-1].body
+        match = re.search(r"uid=([^&\s]+)&token=(\S+)", body)
+        return match.group(1), match.group(2)
+
+    # --- trocar a senha estando logado ---
+    def test_change_requires_authentication(self):
+        self.assertEqual(self.client.post(self.change_url, {}, format="json").status_code, 401)
+
+    def test_change_password_keeps_this_session_and_closes_the_others(self):
+        mine, elsewhere = self.token(), self.token()
+        self.credentials(mine)
+        data = {"current_password": PASSWORD, "new_password": self.NEW}
+        self.assertEqual(self.client.post(self.change_url, data, format="json").status_code, 200)
+        self.assertEqual(self.client.get(reverse("auth-me")).status_code, 200)  # esta sessão continua
+        self.credentials(elsewhere)
+        self.assertEqual(self.client.get(reverse("auth-me")).status_code, 401)  # a outra caiu
+        self.client.credentials()
+        self.assertEqual(self.login(PASSWORD).status_code, 400)
+        self.assertEqual(self.login(self.NEW).status_code, 200)
+
+    def test_change_password_rejects_wrong_current_and_weak_new(self):
+        self.credentials(self.token())
+        wrong = self.client.post(
+            self.change_url, {"current_password": "errada", "new_password": self.NEW}, format="json"
+        )
+        self.assertEqual((wrong.status_code, "current_password" in wrong.json()), (400, True))
+        weak = self.client.post(
+            self.change_url, {"current_password": PASSWORD, "new_password": "12345678"}, format="json"
+        )
+        self.assertEqual((weak.status_code, "new_password" in weak.json()), (400, True))
+        self.client.credentials()
+        self.assertEqual(self.login(PASSWORD).status_code, 200)  # nada mudou
+
+    # --- esqueci a senha: pedido ---
+    def test_reset_request_sends_one_email_with_a_working_link(self):
+        response = self.client.post(self.reset_url, {"email": "ANA@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["ana@example.com"])
+        self.assertIn("https://loja.example.com/redefinir-senha?uid=", mail.outbox[0].body)
+
+    def test_reset_request_never_reveals_whether_the_account_exists(self):
+        known = self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        unknown = self.client.post(self.reset_url, {"email": "ninguem@example.com"}, format="json")
+        self.assertEqual((known.status_code, known.json()), (unknown.status_code, unknown.json()))
+        self.assertEqual(len(mail.outbox), 1)  # só a conta que existe recebeu
+
+    def test_no_email_for_inactive_or_anonymized_accounts(self):
+        inactive = User.objects.create_user("inativa@example.com", password=PASSWORD, is_active=False)
+        self.client.post(self.reset_url, {"email": inactive.email}, format="json")
+        anonymize_user(self.user)
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_reset_request_is_throttled(self):
+        statuses = [
+            self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json").status_code for _ in range(6)
+        ]
+        self.assertEqual(statuses, [200] * 5 + [429])
+
+    # --- esqueci a senha: confirmação ---
+    def test_reset_with_the_emailed_link(self):
+        old_token = self.token()
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        uid, token = self.reset_link_parts()
+        response = self.client.post(
+            self.confirm_url, {"uid": uid, "token": token, "new_password": self.NEW}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.login(self.NEW).status_code, 200)
+        self.assertEqual(self.login(PASSWORD).status_code, 400)
+        self.credentials(old_token)
+        self.assertEqual(self.client.get(reverse("auth-me")).status_code, 401)  # sessões antigas encerradas
+
+    def test_the_link_works_only_once(self):
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        uid, token = self.reset_link_parts()
+        data = {"uid": uid, "token": token, "new_password": self.NEW}
+        self.assertEqual(self.client.post(self.confirm_url, data, format="json").status_code, 200)
+        again = self.client.post(self.confirm_url, {**data, "new_password": "Terceira-senha-789"}, format="json")
+        self.assertEqual(again.status_code, 400)
+
+    def test_invalid_token_and_invalid_uid_are_rejected(self):
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        uid, token = self.reset_link_parts()
+        bad_token = self.client.post(
+            self.confirm_url, {"uid": uid, "token": "x" * 30, "new_password": self.NEW}, format="json"
+        )
+        bad_uid = self.client.post(
+            self.confirm_url, {"uid": "naoeumuid", "token": token, "new_password": self.NEW}, format="json"
+        )
+        self.assertEqual((bad_token.status_code, bad_uid.status_code), (400, 400))
+        self.assertEqual(bad_token.json(), bad_uid.json())  # mesma mensagem
+        self.assertEqual(self.login(PASSWORD).status_code, 200)
+
+    def test_weak_new_password_is_rejected_and_the_link_keeps_working(self):
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        uid, token = self.reset_link_parts()
+        weak = self.client.post(
+            self.confirm_url, {"uid": uid, "token": token, "new_password": "12345678"}, format="json"
+        )
+        self.assertEqual((weak.status_code, "new_password" in weak.json()), (400, True))
+        ok = self.client.post(self.confirm_url, {"uid": uid, "token": token, "new_password": self.NEW}, format="json")
+        self.assertEqual(ok.status_code, 200)
+
+    @override_settings(PASSWORD_RESET_TIMEOUT=-1)
+    def test_expired_link_is_rejected(self):
+        self.client.post(self.reset_url, {"email": "ana@example.com"}, format="json")
+        uid, token = self.reset_link_parts()
+        response = self.client.post(
+            self.confirm_url, {"uid": uid, "token": token, "new_password": self.NEW}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)

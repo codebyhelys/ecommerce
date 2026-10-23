@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
 from django.db.models.functions import Lower
@@ -46,3 +47,34 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.email
+
+
+class Address(models.Model):
+    MAX_PER_USER = 10
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="addresses")
+    label = models.CharField(max_length=50, blank=True)  # ex.: "Casa", "Trabalho"
+    recipient_name = models.CharField(max_length=120)
+    zip_code = models.CharField(max_length=9)
+    street = models.CharField(max_length=200)
+    number = models.CharField(max_length=20)
+    complement = models.CharField(max_length=100, blank=True)
+    district = models.CharField(max_length=100)
+    city = models.CharField(max_length=100)
+    state = models.CharField(max_length=2)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-is_default", "-created_at", "-id"]
+        verbose_name_plural = "addresses"
+        constraints = [
+            # no máximo um endereço padrão por usuário
+            models.UniqueConstraint(
+                fields=["user"], condition=models.Q(is_default=True), name="address_one_default_per_user"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.label or self.street}, {self.number} - {self.city}/{self.state}"

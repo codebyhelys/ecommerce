@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 import sys
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from decouple import Csv, config
@@ -42,8 +43,12 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'corsheaders',
+    'drf_spectacular',
     'products',
     'orders',
+    'coupons',
+    'reviews',
     'payments',
     'django_filters',
     'accounts',
@@ -53,6 +58,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -60,6 +66,12 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+if not DEBUG:
+    # em produção o gunicorn serve os estáticos (admin, docs); em desenvolvimento o runserver já faz isso
+    MIDDLEWARE.insert(
+        MIDDLEWARE.index('corsheaders.middleware.CorsMiddleware') + 1, 'whitenoise.middleware.WhiteNoiseMiddleware'
+    )
 
 ROOT_URLCONF = 'core.urls'
 
@@ -144,13 +156,28 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticatedOrReadOnly",
     ],
     "DEFAULT_THROTTLE_CLASSES": ["core.throttling.AnonThrottle", "core.throttling.UserThrottle"],
-    "DEFAULT_THROTTLE_RATES": {"login": "5/min", "register": "10/hour"},
+    "DEFAULT_THROTTLE_RATES": {"login": "5/min", "register": "10/hour", "coupon": "20/min", "password_reset": "5/hour"},
 }
 AUTH_USER_MODEL = 'accounts.User'
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "E-commerce API",
+    "DESCRIPTION": "API da loja. Autenticação: `Authorization: Token <token>` (token devolvido em /api/auth/login/).",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+}
+
+# CORS: o front-end (outra origem) chama a API com o token no cabeçalho Authorization, sem cookies.
+# Liste as origens exatas, separadas por vírgula. Em produção o padrão é nenhuma.
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS', default='http://localhost:3000,http://127.0.0.1:3000' if DEBUG else '', cast=Csv()
+)
+CORS_URLS_REGEX = r'^/api/.*$'
 
 REST_KNOX = {
     "TOKEN_TTL": timedelta(days=7),
@@ -166,6 +193,10 @@ PAYMENT_WEBHOOK_SECRET = config('PAYMENT_WEBHOOK_SECRET', default='')
 THROTTLE_ANON_RATE = config('THROTTLE_ANON_RATE', default='100/min')
 THROTTLE_USER_RATE = config('THROTTLE_USER_RATE', default='300/min')
 
+# Frete: valor fixo, grátis a partir de SHIPPING_FREE_ABOVE (vazio desativa o frete grátis)
+SHIPPING_FLAT_RATE = config('SHIPPING_FLAT_RATE', default='19.90', cast=Decimal)
+SHIPPING_FREE_ABOVE = config('SHIPPING_FREE_ABOVE', default='299.00', cast=lambda v: Decimal(v) if v else None)
+
 # Expiração de pedidos não pagos (comando expire_pending_orders)
 ORDER_PENDING_TTL_MINUTES = config('ORDER_PENDING_TTL_MINUTES', default=60, cast=int)
 PAYMENT_WINDOW_MINUTES = config('PAYMENT_WINDOW_MINUTES', default=30, cast=int)
@@ -173,6 +204,7 @@ PAYMENT_STALE_MINUTES = config('PAYMENT_STALE_MINUTES', default=10, cast=int)
 
 # --- Produção (com DEBUG=False os padrões abaixo são os seguros; tudo pode ser sobrescrito no ambiente) ---
 SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=not DEBUG, cast=bool)
+SECURE_REDIRECT_EXEMPT = [r'^api/health/$']  # a sonda do balanceador chega por HTTP simples
 SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
 CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
 SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=0 if DEBUG else 3600, cast=int)
@@ -181,6 +213,16 @@ if config('BEHIND_PROXY', default=False, cast=bool):
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    # serve o CSS/JS do admin pelo próprio gunicorn (sem manifesto: não exige collectstatic nos testes)
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage'},
+}
+
+# Imagens enviadas (produtos). Em produção sirva MEDIA_ROOT pelo proxy ou use um storage de objetos.
+MEDIA_URL = 'media/'
+MEDIA_ROOT = config('MEDIA_ROOT', default=str(BASE_DIR / 'media'))
+PRODUCT_IMAGE_MAX_BYTES = config('PRODUCT_IMAGE_MAX_BYTES', default=5 * 1024 * 1024, cast=int)
 
 LOGGING = {
     'version': 1,
@@ -193,3 +235,16 @@ LOGGING = {
 # Testes: hash de senha rápido (o PBKDF2 padrão deixa a suíte lenta e não é o que está sendo testado)
 if sys.argv[1:2] == ['test']:
     PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+
+# E-mail (em desenvolvimento imprime no console; em produção configure o SMTP pelo ambiente)
+EMAIL_BACKEND = config('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = config('EMAIL_HOST', default='localhost')
+EMAIL_PORT = config('EMAIL_PORT', default=25, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=False, cast=bool)
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='Loja <nao-responda@loja.local>')
+
+# Endereço do frontend, usado nos links enviados por e-mail
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+PASSWORD_RESET_TIMEOUT = 3600  # o link de redefinição vale 1 hora

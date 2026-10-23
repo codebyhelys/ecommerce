@@ -1,5 +1,7 @@
 from django.http import Http404
-from rest_framework import mixins, permissions, status, viewsets
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, inline_serializer
+from rest_framework import mixins, permissions, serializers, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -14,11 +16,14 @@ class PaymentViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
     serializer_class = PaymentSerializer
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # geração do esquema OpenAPI, sem usuário
+            return Payment.objects.none()
         qs = Payment.objects.all()
         if not self.request.user.is_staff:
             qs = qs.filter(order__user=self.request.user)
         return qs
 
+    @extend_schema(request=PaymentCreateSerializer, responses={201: PaymentSerializer})
     def create(self, request):
         serializer = PaymentCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -37,6 +42,10 @@ class WebhookView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = []  # o provedor pode mandar rajadas; a proteção aqui é a assinatura
 
+    @extend_schema(
+        request=OpenApiTypes.OBJECT,
+        responses=inline_serializer("WebhookResult", {"status": serializers.CharField()}),
+    )
     def post(self, request, provider):
         try:
             result = services.handle_webhook(provider, request.headers, request.body)

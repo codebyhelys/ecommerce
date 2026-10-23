@@ -15,7 +15,13 @@ class Order(models.Model):
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="orders")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    # total = subtotal - discount + shipping_cost (tudo congelado no momento da compra)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    shipping_cost = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    coupon_code = models.CharField(max_length=40, blank=True)
+    tracking_code = models.CharField(max_length=60, blank=True)
 
     shipping_name = models.CharField(max_length=120)
     shipping_zip_code = models.CharField(max_length=9)

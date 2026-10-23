@@ -22,12 +22,16 @@ class OrderAdmin(admin.ModelAdmin):
     search_fields = ["id", "user__email"]
     date_hierarchy = "created_at"
     inlines = [OrderItemInline]
-    actions = ["mark_shipped", "mark_delivered", "cancel_orders"]
+    actions = ["mark_shipped", "mark_delivered", "cancel_orders", "cancel_paid_orders"]
     # nada é editável à mão: o status só muda pelas ações abaixo (que respeitam as regras do sistema)
     readonly_fields = [
         "user",
         "status",
         "total",
+        "subtotal",
+        "discount",
+        "shipping_cost",
+        "coupon_code",
         "created_at",
         "updated_at",
         "shipping_name",
@@ -68,3 +72,7 @@ class OrderAdmin(admin.ModelAdmin):
     @admin.action(description="Cancelar (pedidos pendentes; devolve o estoque)")
     def cancel_orders(self, request, queryset):
         self._run(request, queryset, services.cancel_order, "cancelado(s)")
+
+    @admin.action(description="Cancelar pedidos PAGOS ainda não enviados (devolve o estoque; estorno fica pendente)")
+    def cancel_paid_orders(self, request, queryset):
+        self._run(request, queryset, services.cancel_paid_order, "cancelado(s) com estorno pendente")

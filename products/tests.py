@@ -1,12 +1,19 @@
+import io
+import shutil
+import tempfile
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
+from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from PIL import Image
 from rest_framework.test import APITestCase
 
-from .models import Category, Product
+from .models import Category, Product, ProductImage
 from .serializers import ProductSerializer
 
 
@@ -264,3 +271,144 @@ class ProductAdminActionTests(TestCase):
         self.run_action("activate", self.hidden)
         self.hidden.refresh_from_db()
         self.assertTrue(self.hidden.is_active)
+
+
+def image_bytes(fmt="PNG", size=(4, 4)):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, "red").save(buffer, fmt)
+    return buffer.getvalue()
+
+
+def upload(name="foto.png", content=None, content_type="image/png"):
+    return SimpleUploadedFile(name, image_bytes() if content is None else content, content_type=content_type)
+
+
+class ProductImageAPITests(APITestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, root, True)
+        cls.media_root = root
+        cls.enterClassContext(override_settings(MEDIA_ROOT=root))  # nenhum teste escreve na pasta media real
+
+    def setUp(self):
+        category = Category.objects.create(name="Camisetas", slug="camisetas")
+        self.product = make_product(category, "camiseta", "49.90")
+        self.staff = get_user_model().objects.create_user("staff", password="senha-teste", is_staff=True)
+        self.customer = get_user_model().objects.create_user("cliente", password="senha-teste")
+        self.url = reverse("product-add-image", kwargs={"slug": "camiseta"})
+
+    def post_image(self, **fields):
+        fields.setdefault("image", upload())
+        return self.client.post(self.url, fields, format="multipart")
+
+    def test_staff_uploads_an_image(self):
+        self.client.force_authenticate(self.staff)
+        response = self.post_image(alt_text="Frente")
+        self.assertEqual(response.status_code, 201, response.content)
+        body = response.json()
+        self.assertEqual((body["alt_text"], body["position"]), ("Frente", 0))
+        self.assertTrue(body["image"].startswith("http://testserver/media/products/"))
+        self.assertTrue(ProductImage.objects.get().image.storage.exists(ProductImage.objects.get().image.name))
+
+    def test_stored_name_ignores_what_the_client_sent(self):
+        self.client.force_authenticate(self.staff)
+        self.post_image(image=upload("../../evil name.PNG"))
+        image = ProductImage.objects.get()
+        self.assertRegex(image.image.name, r"^products/[0-9a-f]{32}\.png$")
+        self.assertTrue(image.image.path.startswith(self.media_root))
+
+    def test_new_images_go_to_the_end_unless_a_position_is_given(self):
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.post_image().json()["position"], 0)
+        self.assertEqual(self.post_image().json()["position"], 1)
+        self.assertEqual(self.post_image(position=0).json()["position"], 0)
+
+    def test_images_appear_in_the_public_product(self):
+        self.client.force_authenticate(self.staff)
+        self.post_image(alt_text="Frente")
+        self.client.force_authenticate(None)
+        images = self.client.get(reverse("product-detail", kwargs={"slug": "camiseta"})).json()["images"]
+        self.assertEqual([i["alt_text"] for i in images], ["Frente"])
+
+    def test_only_staff_can_upload_or_delete(self):
+        self.assertEqual(self.post_image().status_code, 401)
+        self.client.force_authenticate(self.customer)
+        self.assertEqual(self.post_image().status_code, 403)
+        image = ProductImage.objects.create(product=self.product, image="products/x.png")
+        url = reverse("product-remove-image", kwargs={"slug": "camiseta", "image_id": image.pk})
+        self.assertEqual(self.client.delete(url).status_code, 403)
+        self.assertTrue(ProductImage.objects.filter(pk=image.pk).exists())
+
+    def test_rejects_files_that_are_not_images(self):
+        self.client.force_authenticate(self.staff)
+        response = self.post_image(image=upload("fake.png", b"isto nao e uma imagem"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("image", response.json())
+        self.assertFalse(ProductImage.objects.exists())
+
+    def test_rejects_formats_outside_the_whitelist(self):
+        self.client.force_authenticate(self.staff)
+        response = self.post_image(image=upload("a.gif", image_bytes("GIF"), "image/gif"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Formato não suportado", str(response.json()["image"]))
+
+    @override_settings(PRODUCT_IMAGE_MAX_BYTES=10)
+    def test_rejects_files_over_the_size_limit(self):
+        self.client.force_authenticate(self.staff)
+        response = self.post_image()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no máximo", str(response.json()["image"]))
+
+    def test_image_is_required(self):
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.post(self.url, {}, format="multipart").status_code, 400)
+
+    def test_limit_of_images_per_product(self):
+        for i in range(ProductImage.MAX_PER_PRODUCT):
+            ProductImage.objects.create(product=self.product, image=f"products/{i}.png", position=i)
+        self.client.force_authenticate(self.staff)
+        response = self.post_image()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Limite", str(response.json()["image"]))
+
+    def test_delete_removes_the_row_and_the_file_after_commit(self):
+        self.client.force_authenticate(self.staff)
+        self.post_image()
+        image = ProductImage.objects.get()
+        path = image.image.path
+        url = reverse("product-remove-image", kwargs={"slug": "camiseta", "image_id": image.pk})
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(self.client.delete(url).status_code, 204)
+        self.assertFalse(ProductImage.objects.exists())
+        self.assertFalse(image.image.storage.exists(image.image.name), path)
+
+    def test_delete_does_not_reach_images_of_another_product(self):
+        other = make_product(self.product.category, "outra", "10")
+        image = ProductImage.objects.create(product=other, image="products/x.png")
+        self.client.force_authenticate(self.staff)
+        url = reverse("product-remove-image", kwargs={"slug": "camiseta", "image_id": image.pk})
+        self.assertEqual(self.client.delete(url).status_code, 404)
+        self.assertTrue(ProductImage.objects.filter(pk=image.pk).exists())
+
+    def test_deleting_a_product_removes_its_files(self):
+        self.client.force_authenticate(self.staff)
+        self.post_image()
+        image = ProductImage.objects.get()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.product.delete()
+        self.assertFalse(image.image.storage.exists(image.image.name))
+
+    def test_listing_does_not_query_per_product(self):
+        def count_queries():
+            with CaptureQueriesContext(connection) as ctx:
+                self.client.get(reverse("product-list"))
+            return len(ctx)
+
+        ProductImage.objects.create(product=self.product, image="products/a.png")
+        baseline = count_queries()
+        for i in range(5):
+            extra = make_product(self.product.category, f"extra-{i}", "10")
+            ProductImage.objects.create(product=extra, image=f"products/e{i}.png")
+        self.assertEqual(count_queries(), baseline)

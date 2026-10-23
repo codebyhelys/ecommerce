@@ -4,3 +4,11 @@ django-filter==26.1
 psycopg[binary]==3.3.5
 python-decouple==3.8
 django-rest-knox==5.1.0
+
+pillow==13.0.0
+
+django-cors-headers==4.9.0
+drf-spectacular==0.30.0
+
+gunicorn==26.2.0
+whitenoise==6.12.0

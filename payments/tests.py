@@ -2,9 +2,11 @@ import hashlib
 import hmac
 import json
 import threading
+from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth import get_user_model
+from django.core import mail
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
 from django.test import SimpleTestCase, TransactionTestCase, override_settings
@@ -13,12 +15,13 @@ from rest_framework.test import APIClient, APITestCase
 
 from cart.services import add_item
 from orders.models import Order
-from orders.services import cancel_order, create_order
+from orders.services import cancel_order, cancel_paid_order, create_order
 from products.models import Category, Product
 
 from .checks import fake_gateway_in_production
 from .gateways import FakeGateway, get_gateway
 from .models import Payment, WebhookEvent
+from .services import RefundNotPending, mark_refunded, start_payment
 
 User = get_user_model()
 PASSWORD = "Senha-forte-123"
@@ -73,7 +76,7 @@ def send_event(
     )
 
 
-@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET)
+@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET, SHIPPING_FLAT_RATE=Decimal("0.00"))
 class StartPaymentTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
@@ -140,7 +143,7 @@ class StartPaymentTests(APITestCase):
         self.assertEqual(self.client.get(self.url).json()["count"], 0)
 
 
-@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET)
+@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET, SHIPPING_FLAT_RATE=Decimal("0.00"))
 class WebhookTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
@@ -256,7 +259,7 @@ class WebhookTests(APITestCase):
         self.assertEqual(self.order.status, Order.Status.CANCELLED)  # o pedido NÃO é reaberto
 
 
-@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET)
+@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET, SHIPPING_FLAT_RATE=Decimal("0.00"))
 class PaymentConcurrencyTests(TransactionTestCase):
     """Threads com commits reais: só valem em Postgres."""
 
@@ -326,3 +329,78 @@ class GatewayConfigurationTests(SimpleTestCase):
     @override_settings(DEBUG=True, PAYMENT_GATEWAY="fake")
     def test_deploy_check_allows_the_fake_gateway_in_development(self):
         self.assertEqual(fake_gateway_in_production(None), [])
+
+
+@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET, SHIPPING_FLAT_RATE=Decimal("0.00"))
+class PaidEmailTests(APITestCase):
+    def test_paying_the_order_sends_exactly_one_confirmation(self):
+        user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        order = make_order(user)
+        payment = start_payment(user=user, order_id=order.pk, method="pix")
+        with self.captureOnCommitCallbacks(execute=True):
+            send_event(APIClient(), payment.provider_reference)
+        with self.captureOnCommitCallbacks(execute=True):
+            send_event(APIClient(), payment.provider_reference)  # reentrega: 'duplicate', sem novo e-mail
+        subjects = [m.subject for m in mail.outbox]
+        self.assertEqual(subjects, [f"Pagamento confirmado: pedido #{order.pk}"])
+
+
+@override_settings(PAYMENT_GATEWAY="fake", PAYMENT_WEBHOOK_SECRET=SECRET, SHIPPING_FLAT_RATE=Decimal("0.00"))
+class RefundTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.order = make_order(self.user)
+        self.payment = start_payment(user=self.user, order_id=self.order.pk, method="pix")
+        send_event(APIClient(), self.payment.provider_reference)
+        self.payment.refresh_from_db()
+
+    def cancel_and_flag(self):
+        cancel_paid_order(self.order)
+        self.payment.refresh_from_db()
+
+    def test_marking_a_pending_refund_as_done(self):
+        self.cancel_and_flag()
+        mark_refunded(self.payment)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, "refunded")
+        self.assertFalse(self.payment.needs_refund)
+        self.assertIsNotNone(self.payment.refunded_at)
+
+    def test_it_cannot_be_registered_twice(self):
+        self.cancel_and_flag()
+        mark_refunded(self.payment)
+        with self.assertRaises(RefundNotPending):
+            mark_refunded(self.payment)
+
+    def test_a_payment_that_does_not_need_a_refund_cannot_be_marked(self):
+        with self.assertRaises(RefundNotPending):  # pedido pago e vigente: nada a estornar
+            mark_refunded(self.payment)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, "approved")
+
+    def test_late_payment_flow_ends_in_a_registered_refund(self):
+        order = make_order(self.user)
+        late = start_payment(user=self.user, order_id=order.pk, method="pix")
+        cancel_order(order)
+        send_event(APIClient(), late.provider_reference, event_id="evt_late")
+        late.refresh_from_db()
+        self.assertTrue(late.needs_refund)
+        mark_refunded(late)
+        late.refresh_from_db()
+        self.assertEqual(late.status, "refunded")
+
+    def test_admin_action_registers_the_refund(self):
+        self.cancel_and_flag()
+        admin_user = User.objects.create_superuser("root@example.com", password=PASSWORD)
+        self.client.force_login(admin_user)
+        data = {"action": "mark_refunded", "_selected_action": [self.payment.pk]}
+        self.client.post(reverse("admin:payments_payment_changelist"), data, follow=True)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, "refunded")
+
+    def test_the_webhook_cannot_declare_a_refund(self):
+        # estornos são decididos pela equipe; o provedor só confirma pagamentos
+        response = send_event(APIClient(), self.payment.provider_reference, status="refunded", event_id="evt_r")
+        self.assertEqual(response.status_code, 400)
+        self.payment.refresh_from_db()
+        self.assertEqual(self.payment.status, "approved")

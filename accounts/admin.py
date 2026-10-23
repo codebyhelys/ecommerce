@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import AdminUserCreationForm
 
-from .models import User
+from .models import Address, User
 
 
 class UserCreationForm(AdminUserCreationForm):
@@ -26,3 +26,10 @@ class UserAdmin(BaseUserAdmin):
         ("Datas", {"fields": ("last_login", "date_joined")}),
     )
     add_fieldsets = ((None, {"classes": ("wide",), "fields": ("email", "usable_password", "password1", "password2")}),)
+
+
+@admin.register(Address)
+class AddressAdmin(admin.ModelAdmin):
+    list_display = ["id", "user", "label", "city", "state", "is_default"]
+    search_fields = ["user__email", "street", "city"]
+    list_filter = ["state", "is_default"]

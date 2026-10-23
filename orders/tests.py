@@ -2,23 +2,35 @@ import threading
 from datetime import timedelta
 from decimal import Decimal
 from io import StringIO
+from unittest import mock
 
 from django.contrib.auth import get_user_model
+from django.core import mail
 from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
+from accounts.models import Address
 from cart.models import Cart
 from cart.services import add_item
 from payments.models import Payment
 from products.models import Category, Product
 
+from .emails import build_order_email
 from .models import Order
-from .services import InvalidOrderState, create_order, deliver_order, expire_pending_orders, ship_order
+from .services import (
+    InvalidOrderState,
+    cancel_order,
+    cancel_paid_order,
+    create_order,
+    deliver_order,
+    expire_pending_orders,
+    ship_order,
+)
 
 User = get_user_model()
 PASSWORD = "Senha-forte-123"
@@ -46,6 +58,7 @@ def make_catalog():
     return shirt, cap
 
 
+@override_settings(SHIPPING_FLAT_RATE=Decimal("0.00"))  # estes testes tratam só do valor dos itens
 class OrderAPITests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
@@ -402,3 +415,248 @@ class OrderAdminTests(TestCase):
         self.assertEqual(self.status(paid), "paid")
         self.shirt.refresh_from_db()
         self.assertEqual(self.shirt.stock, stock_before + 1)
+
+
+class OrderWithSavedAddressTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        self.other = User.objects.create_user("beto@example.com", password=PASSWORD)
+        make_catalog()
+        self.address = Address.objects.create(
+            user=self.user,
+            recipient_name="Maria Souza",
+            zip_code="20040-020",
+            street="Rua da Assembleia",
+            number="10",
+            complement="sala 3",
+            district="Centro",
+            city="Rio de Janeiro",
+            state="RJ",
+        )
+        self.url = reverse("order-list")
+        self.client.force_authenticate(self.user)
+        add_item(self.user, "camiseta", 1)
+
+    def test_checkout_with_a_saved_address_copies_it_into_the_order(self):
+        response = self.client.post(self.url, {"address": self.address.pk}, format="json")
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["shipping_name"], "Maria Souza")
+        self.assertEqual(body["shipping_city"], "Rio de Janeiro")
+        self.assertEqual(body["shipping_complement"], "sala 3")
+        # editar o endereço depois não altera o pedido já feito
+        Address.objects.filter(pk=self.address.pk).update(city="Niterói")
+        self.assertEqual(Order.objects.get().shipping_city, "Rio de Janeiro")
+
+    def test_someone_elses_address_is_rejected(self):
+        theirs = Address.objects.create(
+            user=self.other,
+            recipient_name="X",
+            zip_code="20040-020",
+            street="R",
+            number="1",
+            district="C",
+            city="Rio",
+            state="RJ",
+        )
+        for pk in (theirs.pk, 999999):
+            response = self.client.post(self.url, {"address": pk}, format="json")
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["address"], ["Endereço inválido."])  # sem revelar se existe
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_without_address_and_without_fields_lists_what_is_missing(self):
+        response = self.client.post(self.url, {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("shipping_zip_code", response.json())
+        self.assertNotIn("shipping_complement", response.json())  # opcional
+
+    def test_saved_address_wins_over_loose_fields(self):
+        data = {"address": self.address.pk, "shipping_city": "Outra Cidade"}
+        self.client.post(self.url, data, format="json")
+        self.assertEqual(Order.objects.get().shipping_city, "Rio de Janeiro")
+
+
+@override_settings(SHIPPING_FLAT_RATE=Decimal("19.90"), SHIPPING_FREE_ABOVE=Decimal("100.00"))
+class OrderShippingTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()  # camiseta 49.90, boné 30.00
+        self.client.force_authenticate(self.user)
+        self.url = reverse("order-list")
+
+    def checkout(self):
+        return self.client.post(self.url, SHIPPING, format="json").json()
+
+    def test_below_the_threshold_the_flat_rate_is_charged(self):
+        add_item(self.user, "camiseta", 1)  # 49.90
+        order = self.checkout()
+        self.assertEqual(
+            (order["subtotal"], order["discount"], order["shipping_cost"], order["total"]),
+            ("49.90", "0.00", "19.90", "69.80"),
+        )
+
+    def test_at_or_above_the_threshold_shipping_is_free(self):
+        add_item(self.user, "camiseta", 2)  # 99.80 -> ainda abaixo
+        add_item(self.user, "bone", 1)  # + 30.00 = 129.80
+        order = self.checkout()
+        self.assertEqual((order["shipping_cost"], order["total"]), ("0.00", "129.80"))
+
+    @override_settings(SHIPPING_FREE_ABOVE=None)
+    def test_free_shipping_can_be_disabled(self):
+        add_item(self.user, "camiseta", 2)
+        add_item(self.user, "bone", 1)
+        self.assertEqual(self.checkout()["shipping_cost"], "19.90")
+
+    def test_the_shipping_paid_is_frozen_in_the_order(self):
+        add_item(self.user, "camiseta", 1)
+        order = self.checkout()
+        with override_settings(SHIPPING_FLAT_RATE=Decimal("99.00")):
+            again = self.client.get(reverse("order-detail", kwargs={"pk": order["id"]})).json()
+        self.assertEqual(again["shipping_cost"], "19.90")
+
+    def test_the_payment_amount_includes_shipping(self):
+        add_item(self.user, "camiseta", 1)
+        order_id = self.checkout()["id"]
+        self.assertEqual(Order.objects.get(pk=order_id).total, Decimal("69.80"))
+
+
+@override_settings(SHIPPING_FLAT_RATE=Decimal("10.00"), SHIPPING_FREE_ABOVE=None)
+class OrderEmailTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()
+        add_item(self.user, "camiseta", 2)  # 99.80 + frete 10.00
+
+    def place(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            return create_order(user=self.user, shipping=SHIPPING)
+
+    def test_order_creation_sends_a_confirmation(self):
+        order = self.place()
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual((message.to, message.subject), (["ana@example.com"], f"Recebemos o seu pedido #{order.pk}"))
+        for text in ("2 x Camiseta", "Subtotal: R$ 99,80", "Frete: R$ 10,00", "Total: R$ 109,80", "Avenida Paulista"):
+            self.assertIn(text, message.body)
+
+    def test_nothing_is_sent_when_the_transaction_does_not_commit(self):
+        # sem executar os callbacks de commit (como numa transação que falhou) nada sai
+        create_order(user=self.user, shipping=SHIPPING)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_cancellation_sends_an_email(self):
+        order = self.place()
+        mail.outbox.clear()
+        with self.captureOnCommitCallbacks(execute=True):
+            cancel_order(order)
+        self.assertEqual([m.subject for m in mail.outbox], [f"Pedido #{order.pk} cancelado"])
+
+    def test_shipping_email_carries_the_tracking_code(self):
+        order = self.place()
+        Order.objects.filter(pk=order.pk).update(status="paid", tracking_code="BR123456789")
+        mail.outbox.clear()
+        with self.captureOnCommitCallbacks(execute=True):
+            ship_order(order)
+        self.assertIn("Código de rastreio: BR123456789", mail.outbox[0].body)
+        with self.captureOnCommitCallbacks(execute=True):
+            deliver_order(order)
+        self.assertEqual(mail.outbox[-1].subject, f"Seu pedido #{order.pk} foi entregue")
+
+    def test_a_coupon_discount_appears_in_the_email(self):
+        order = self.place()
+        Order.objects.filter(pk=order.pk).update(discount=Decimal("9.98"), coupon_code="PROMO10")
+        order.refresh_from_db()
+        _, body = build_order_email(order, "created")
+        self.assertIn("Desconto (PROMO10): -R$ 9,98", body)
+
+    def test_an_email_failure_never_breaks_the_order(self):
+        with mock.patch("orders.emails.send_mail", side_effect=OSError("SMTP fora do ar")):
+            order = self.place()  # não levanta
+        self.assertTrue(Order.objects.filter(pk=order.pk).exists())
+
+    def test_closed_accounts_receive_nothing(self):
+        order = self.place()
+        mail.outbox.clear()
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        order.refresh_from_db()
+        with self.captureOnCommitCallbacks(execute=True):
+            cancel_order(order)
+        self.assertEqual(len(mail.outbox), 0)
+
+
+class OrderAdminTrackingTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser("root@example.com", password=PASSWORD)
+        self.client.force_login(self.admin)
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()
+        add_item(self.user, "camiseta", 1)
+        self.order = create_order(user=self.user, shipping=SHIPPING)
+        Order.objects.filter(pk=self.order.pk).update(status="paid")
+
+    def test_tracking_code_is_editable_but_money_fields_are_not(self):
+        html = self.client.get(reverse("admin:orders_order_change", args=[self.order.pk])).content.decode()
+        self.assertIn('name="tracking_code"', html)
+        for field in ("total", "subtotal", "discount", "shipping_cost", "status"):
+            self.assertNotIn(f'name="{field}"', html)
+
+    def test_shipping_from_the_admin_sends_the_stored_tracking_code(self):
+        Order.objects.filter(pk=self.order.pk).update(tracking_code="BR999")
+        data = {"action": "mark_shipped", "_selected_action": [self.order.pk]}
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(reverse("admin:orders_order_changelist"), data, follow=True)
+        self.assertIn("Código de rastreio: BR999", mail.outbox[-1].body)
+
+
+@override_settings(SHIPPING_FLAT_RATE=Decimal("0.00"))
+class CancelPaidOrderTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()
+        add_item(self.user, "camiseta", 2)
+        self.order = create_order(user=self.user, shipping=SHIPPING)
+        self.payment = Payment.objects.create(
+            order=self.order,
+            provider="fake",
+            method="pix",
+            status="approved",
+            amount=self.order.total,
+            provider_reference="ref-1",
+            paid_at=timezone.now(),
+        )
+        Order.objects.filter(pk=self.order.pk).update(status="paid")
+        self.stock_after_purchase = Product.objects.get(slug="camiseta").stock
+
+    def test_cancelling_returns_stock_and_flags_the_refund(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            cancel_paid_order(self.order)
+        self.order.refresh_from_db()
+        self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CANCELLED)
+        self.assertEqual(Product.objects.get(slug="camiseta").stock, self.stock_after_purchase + 2)
+        self.assertEqual((self.payment.status, self.payment.needs_refund), ("approved", True))
+        self.assertEqual(mail.outbox[-1].subject, f"Pedido #{self.order.pk} cancelado")
+
+    def test_only_paid_orders_can_be_cancelled_this_way(self):
+        for status in ("pending", "shipped", "delivered", "cancelled"):
+            Order.objects.filter(pk=self.order.pk).update(status=status)
+            with self.assertRaises(InvalidOrderState, msg=status):
+                cancel_paid_order(self.order)
+        self.payment.refresh_from_db()
+        self.assertFalse(self.payment.needs_refund)
+        self.assertEqual(Product.objects.get(slug="camiseta").stock, self.stock_after_purchase)
+
+    def test_the_regular_cancellation_still_refuses_paid_orders(self):
+        with self.assertRaises(InvalidOrderState):
+            cancel_order(self.order)
+
+    def test_admin_action_cancels_paid_orders(self):
+        admin_user = User.objects.create_superuser("root@example.com", password=PASSWORD)
+        self.client.force_login(admin_user)
+        data = {"action": "cancel_paid_orders", "_selected_action": [self.order.pk]}
+        self.client.post(reverse("admin:orders_order_changelist"), data, follow=True)
+        self.order.refresh_from_db()
+        self.payment.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CANCELLED)
+        self.assertTrue(self.payment.needs_refund)

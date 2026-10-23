@@ -11,9 +11,13 @@ from rest_framework.exceptions import APIException, ValidationError
 
 from cart.models import Cart
 from cart.services import clear_cart
+from coupons import services as coupon_services
+from coupons.models import CouponRedemption
 from products.models import Product
 
+from .emails import send_order_email
 from .models import Order, OrderItem
+from .shipping import calculate_shipping
 
 
 class InvalidOrderState(APIException):
@@ -23,7 +27,7 @@ class InvalidOrderState(APIException):
 
 
 @transaction.atomic
-def create_order(*, user, shipping):
+def create_order(*, user, shipping, coupon_code=""):
     # trava o carrinho: duas finalizações simultâneas não geram pedido duplicado
     cart = Cart.objects.select_for_update().filter(user=user).first()
     items = list(cart.items.select_related("product").order_by("product_id")) if cart else []
@@ -47,8 +51,12 @@ def create_order(*, user, shipping):
     if errors:
         raise ValidationError({"items": errors})
 
-    order = Order.objects.create(user=user, **shipping)
-    total = Decimal("0.00")
+    subtotal = sum((products[i.product_id].price * i.quantity for i in items), Decimal("0.00"))
+    coupon, discount = None, Decimal("0.00")
+    if coupon_code:  # valida ANTES de gravar qualquer coisa (e trava o cupom contra usos simultâneos)
+        coupon, discount = coupon_services.get_valid_coupon(coupon_code, user=user, subtotal=subtotal, lock=True)
+
+    order = Order.objects.create(user=user, coupon_code=coupon.code if coupon else "", **shipping)
     for item in items:
         product = products[item.product_id]
         OrderItem.objects.create(
@@ -60,20 +68,22 @@ def create_order(*, user, shipping):
         )
         product.stock -= item.quantity
         product.save(update_fields=["stock", "updated_at"])
-        total += product.price * item.quantity
 
-    order.total = total
-    order.save(update_fields=["total", "updated_at"])
+    shipping_cost = calculate_shipping(subtotal - discount)
+    order.subtotal = subtotal
+    order.discount = discount
+    order.shipping_cost = shipping_cost
+    order.total = subtotal - discount + shipping_cost
+    order.save(update_fields=["subtotal", "discount", "shipping_cost", "total", "updated_at"])
+    if coupon:
+        CouponRedemption.objects.create(coupon=coupon, user=user, order=order, discount=discount)
     clear_cart(user)
+    transaction.on_commit(lambda: send_order_email(order, "created"))
     return order
 
 
-@transaction.atomic
-def cancel_order(order):
-    order = Order.objects.select_for_update().get(pk=order.pk)
-    if order.status != Order.Status.PENDING:
-        raise InvalidOrderState("Só é possível cancelar pedidos pendentes.")
-
+def _cancel(order):
+    """Devolve o estoque e o cupom e marca o pedido como cancelado. O pedido já deve estar travado."""
     for item in order.items.all():
         Product.objects.filter(pk=item.product_id).update(
             stock=F("stock") + item.quantity,
@@ -82,12 +92,37 @@ def cancel_order(order):
 
     order.status = Order.Status.CANCELLED
     order.save(update_fields=["status", "updated_at"])
+    CouponRedemption.objects.filter(order=order).delete()  # o uso do cupom volta a ficar disponível
     # um pagamento ainda pendente deste pedido deixa de valer
     order.payments.filter(status="pending").update(status="cancelled", updated_at=timezone.now())
+    transaction.on_commit(lambda: send_order_email(order, "cancelled"))
+
+
+@transaction.atomic
+def cancel_order(order):
+    order = Order.objects.select_for_update().get(pk=order.pk)
+    if order.status != Order.Status.PENDING:
+        raise InvalidOrderState("Só é possível cancelar pedidos pendentes.")
+    _cancel(order)
     return order
 
 
-def _advance(order, expected, new):
+@transaction.atomic
+def cancel_paid_order(order):
+    """Cancela um pedido pago e ainda não enviado (decisão da equipe).
+
+    O estoque volta, mas o dinheiro NÃO: o pagamento fica marcado `needs_refund` até alguém estornar
+    no provedor e registrar (payments.services.mark_refunded).
+    """
+    order = Order.objects.select_for_update().get(pk=order.pk)
+    if order.status != Order.Status.PAID:
+        raise InvalidOrderState("Só é possível cancelar desta forma pedidos pagos que ainda não foram enviados.")
+    _cancel(order)
+    order.payments.filter(status="approved").update(needs_refund=True, updated_at=timezone.now())
+    return order
+
+
+def _advance(order, expected, new, event):
     """Move o pedido de `expected` para `new`; qualquer outro estado de origem é recusado."""
     with transaction.atomic():
         order = Order.objects.select_for_update().get(pk=order.pk)
@@ -97,15 +132,16 @@ def _advance(order, expected, new):
             )
         order.status = new
         order.save(update_fields=["status", "updated_at"])
+        transaction.on_commit(lambda: send_order_email(order, event))
         return order
 
 
 def ship_order(order):
-    return _advance(order, Order.Status.PAID, Order.Status.SHIPPED)
+    return _advance(order, Order.Status.PAID, Order.Status.SHIPPED, "shipped")
 
 
 def deliver_order(order):
-    return _advance(order, Order.Status.SHIPPED, Order.Status.DELIVERED)
+    return _advance(order, Order.Status.SHIPPED, Order.Status.DELIVERED, "delivered")
 
 
 def expire_pending_orders():

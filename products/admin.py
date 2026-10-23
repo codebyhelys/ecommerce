@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Category, Product
+from .models import Category, Product, ProductImage
 
 
 @admin.register(Category)
@@ -10,8 +10,14 @@ class CategoryAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
 
 
+class ProductImageInline(admin.TabularInline):
+    model = ProductImage
+    extra = 0
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
+    inlines = [ProductImageInline]
     list_display = ["name", "price", "stock", "category", "is_active"]
     search_fields = ["name"]
     list_filter = ["is_active", "category"]
