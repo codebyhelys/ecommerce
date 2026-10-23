@@ -1,17 +1,19 @@
 # E-commerce — Backend
 
-API REST de um e-commerce: catálogo, contas, carrinho, pedidos e pagamentos.
+API REST de um e-commerce: catálogo, contas, carrinho, cupons, frete, pedidos, pagamentos e avaliações.
 Django 6 + Django REST Framework + PostgreSQL (Docker).
 
 ## Funcionalidades
 
 | App | O que faz |
 |---|---|
-| `products` | Catálogo com categorias, busca, filtros, ordenação e paginação |
-| `accounts` | Usuário com login por e-mail, cadastro, login/logout (tokens Knox) e perfil |
-| `cart` | Carrinho por usuário, com validação de estoque |
-| `orders` | Checkout a partir do carrinho, preço congelado, baixa de estoque e cancelamento |
-| `payments` | Pagamento por pedido, webhook assinado e idempotente |
+| `products` | Catálogo com categorias, busca, filtros, ordenação, paginação e imagens |
+| `accounts` | Login por e-mail, cadastro, tokens Knox, perfil, endereços salvos e recuperação/troca de senha |
+| `cart` | Carrinho por usuário, com validação de estoque e estimativa de frete |
+| `coupons` | Cupons (percentual ou valor fixo) com validade, mínimo, limite total e por usuário |
+| `orders` | Checkout, preço/frete/desconto congelados, estoque, cancelamento, rastreio e e-mails do pedido |
+| `payments` | Pagamento por pedido, webhook assinado e idempotente, controle de estornos |
+| `reviews` | Avaliações de 1 a 5 só de quem comprou, com nota média no produto |
 
 ## Requisitos
 
@@ -106,6 +108,15 @@ elas disputam o mesmo banco de teste.
 | `PAYMENT_WINDOW_MINUTES` | `30` | Enquanto houver pagamento criado há menos que isso, o pedido não expira |
 | `PAYMENT_STALE_MINUTES` | `10` | Pagamento que nunca chegou ao provedor é liberado depois disso |
 | `THROTTLE_ANON_RATE` / `THROTTLE_USER_RATE` | `100/min` / `300/min` | Limite global de requisições (anônimo por IP; logado por usuário) |
+| `SHIPPING_FLAT_RATE` | `19.90` | Frete fixo por pedido |
+| `SHIPPING_FREE_ABOVE` | `299.00` | Frete grátis a partir deste valor dos itens (já com desconto); vazio desativa |
+| `EMAIL_BACKEND` | console | Em produção use `django.core.mail.backends.smtp.EmailBackend` |
+| `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS` | `localhost`, `25`, vazio, vazio, `False` | SMTP (e-mails de pedido e de redefinição de senha) |
+| `DEFAULT_FROM_EMAIL` | `Loja <nao-responda@loja.local>` | Remetente |
+| `FRONTEND_URL` | `http://localhost:3000` | Base do link de redefinição de senha enviado por e-mail |
+| `CORS_ALLOWED_ORIGINS` | localhost:3000 com `DEBUG=True`; vazio caso contrário | Origens do front-end autorizadas a chamar `/api/`, separadas por vírgula |
+| `MEDIA_ROOT` | `./media` | Pasta dos uploads (imagens de produto) |
+| `PRODUCT_IMAGE_MAX_BYTES` | `5242880` | Tamanho máximo de cada imagem (5 MB) |
 | `LOG_LEVEL` | `INFO` | Nível dos logs no console |
 | `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE` | `True` se `DEBUG=False` | Segurança de produção |
 | `SECURE_HSTS_SECONDS` | `3600` se `DEBUG=False` | HSTS (aumente gradualmente em produção) |
@@ -116,31 +127,56 @@ elas disputam o mesmo banco de teste.
 Autenticação: header `Authorization: Token <token>`, obtido em `/api/auth/login/`.
 Listagens são paginadas (12 por página, `?page=2`).
 
+Documentação interativa (OpenAPI/Swagger): **`/api/docs/`**; o esquema bruto está em `/api/schema/`.
+A página usa assets de CDN. A geração do esquema é validada nos testes: uma view nova sem anotação quebra a suíte.
+
 | Rota | Métodos | Acesso |
 |---|---|---|
-| `/api/products/`, `/api/products/<slug>/` | GET público; POST/PUT/PATCH/DELETE staff | `?category=`, `?min_price=`, `?max_price=`, `?search=`, `?ordering=` |
+| `/api/products/`, `/api/products/<slug>/` | GET público; POST/PUT/PATCH/DELETE staff | `?category=`, `?min_price=`, `?max_price=`, `?search=`, `?ordering=`. Traz `images`, `rating_average` e `reviews_count` |
+| `/api/products/<slug>/images/` | POST (staff, `multipart/form-data`: `image`, `alt_text`, `position`) | JPEG, PNG ou WEBP, até 5 MB, no máximo 8 por produto |
+| `/api/products/<slug>/images/<id>/` | DELETE (staff) | Remove a linha e o arquivo |
+| `/api/products/<slug>/reviews/` | GET público; POST logado | Só quem tem pedido pago/enviado/entregue do produto avalia; uma avaliação por usuário (409 se repetir) |
+| `/api/products/<slug>/reviews/<id>/` | GET; PATCH (autor); DELETE (autor ou staff) | |
 | `/api/categories/`, `/api/categories/<slug>/` | GET público; escrita staff | Apagar categoria com produtos retorna 409 |
 | `/api/auth/register/` | POST | Público |
 | `/api/auth/login/` | POST | Público (`{"email", "password"}`) |
 | `/api/auth/logout/`, `/api/auth/logoutall/` | POST | Logado |
 | `/api/auth/me/` | GET, PATCH | Logado |
-| `/api/cart/` | GET, DELETE | Logado |
+| `/api/auth/password/change/` | POST | Logado; exige a senha atual e encerra as outras sessões |
+| `/api/auth/password/reset/` | POST | Público; envia o link por e-mail (resposta igual exista a conta ou não) |
+| `/api/auth/password/reset/confirm/` | POST | Público; `{uid, token, new_password}` |
+| `/api/addresses/`, `/api/addresses/<id>/` | CRUD | Logado; até 10 por conta, um padrão |
+| `/api/coupons/validate/` | POST | Logado; `{"code"}` pré-visualiza o desconto sobre o carrinho (limitado a 20/min) |
+| `/api/cart/` | GET, DELETE | Logado; mostra `shipping_estimate` e `estimated_total` |
 | `/api/cart/items/` | POST | Adiciona (soma se já existir) |
 | `/api/cart/items/<slug>/` | PATCH, DELETE | Altera a quantidade / remove |
-| `/api/orders/` | POST, GET | Finaliza o carrinho (envia só o endereço) / lista os seus |
+| `/api/orders/` | POST, GET | Finaliza o carrinho: `address` (id de um endereço salvo) **ou** os campos `shipping_*`; opcional `coupon`. Lista os seus |
 | `/api/orders/<id>/` | GET | Detalhe (pedido de outro usuário retorna 404) |
 | `/api/orders/<id>/cancel/` | POST | Cancela pedido pendente e devolve o estoque |
 | `/api/payments/` | POST, GET | Inicia pagamento `{"order", "method"}` / lista |
 | `/api/payments/<id>/` | GET | Consulta o status |
+| `/api/health/` | GET | Sonda do balanceador: 200 se o banco responde, 503 se não |
 | `/api/payments/webhooks/<provider>/` | POST | Chamado pelo provedor, protegido por assinatura. Responde `404 unmatched` se o pagamento ainda não existe (o provedor reenvia) |
 
 ## Fluxo de compra
 
 1. Cadastro e login → token.
 2. `POST /api/cart/items/` para cada produto.
-3. `POST /api/orders/` com o endereço de entrega: valida estoque, congela preços, baixa o estoque e esvazia o carrinho.
-4. `POST /api/payments/` com o pedido e o método (ex.: `pix`).
-5. O provedor chama o webhook; o pagamento é aprovado e o pedido passa a `paid`.
+3. (Opcional) `POST /api/coupons/validate/` para mostrar o desconto.
+4. `POST /api/orders/` com o endereço de entrega e o cupom: valida estoque e cupom, congela preços, frete e desconto,
+   baixa o estoque e esvazia o carrinho. O cliente recebe o e-mail de confirmação.
+5. `POST /api/payments/` com o pedido e o método (ex.: `pix`).
+6. O provedor chama o webhook; o pagamento é aprovado, o pedido passa a `paid` e sai o e-mail de pagamento confirmado.
+7. A equipe marca como enviado (com o código de rastreio, editável no admin) e depois como entregue; cada passo avisa o cliente.
+8. Quem comprou pode avaliar o produto.
+
+### Cancelamento e estorno
+
+- Pedido **pendente**: o cliente cancela (`POST /api/orders/<id>/cancel/`) ou ele expira; o estoque e o cupom voltam.
+- Pedido **pago e não enviado**: só a equipe cancela, no admin (*Cancelar pedidos PAGOS…*). O estoque volta e o pagamento
+  fica `needs_refund`. Faça o estorno no painel do provedor e então use, em *Pagamentos*, a ação
+  *Registrar estorno JÁ realizado*: o pagamento vira `refunded`. Filtre por `needs_refund` para ver o que está pendente.
+- Pagamento que chega **depois** do cancelamento também cai em `needs_refund` (o pedido não é reaberto).
 
 ## Decisões de arquitetura
 
@@ -158,6 +194,11 @@ Listagens são paginadas (12 por página, `?page=2`).
 - **Pedidos não pagos expiram** e devolvem o estoque (`expire_pending_orders`).
 - **Status do pedido só muda por regras**: no admin é somente leitura, com ações de enviar, entregar e cancelar.
 - **Edição de produto não sobrescreve o estoque** baixado por um checkout simultâneo.
+- **Total = itens − desconto + frete**, tudo congelado no pedido; o cupom é travado (`select_for_update`) para respeitar os limites de uso.
+- **E-mails só depois do commit** (`transaction.on_commit`) e nunca derrubam a operação: falha de SMTP é registrada no log.
+- **Uploads com nome aleatório**, formato e tamanho validados; o arquivo some junto com a linha (após o commit).
+- **Avaliações**: nota média e contagem calculadas na própria consulta da listagem (sem N+1).
+- **Anonimização** (LGPD) apaga também endereços e avaliações.
 
 ## Tarefas agendadas
 
@@ -191,6 +232,27 @@ Não agende na sua máquina de desenvolvimento: ele cancelaria pedidos de teste 
 - Com `DEBUG=False` o redirecionamento para HTTPS e os cookies seguros ficam ligados. Em testes locais ou CI sem HTTPS,
   defina `SECURE_SSL_REDIRECT=False`.
 - Valide com `python manage.py check --deploy`.
+- Defina `CORS_ALLOWED_ORIGINS` (domínio do front-end), `EMAIL_BACKEND` SMTP e `FRONTEND_URL`.
+- **Uploads**: o Django não serve `/media/` com `DEBUG=False`. Sirva `MEDIA_ROOT` pelo proxy (nginx) ou troque o storage por
+  um bucket de objetos, e mantenha a pasta em um volume persistente.
+
+### Docker
+
+O `Dockerfile` gera uma imagem com gunicorn (3 workers), estáticos servidos por WhiteNoise e usuário sem privilégios.
+
+```bash
+docker build -t ecommerce-backend .
+docker run --env-file .env -e DEBUG=False -e DB_HOST=<host-do-banco> -p 8000:8000 -v media:/app/media ecommerce-backend
+```
+
+As migrações **não** rodam sozinhas ao subir o container. Execute-as como passo de release, uma vez por versão:
+
+```bash
+docker run --rm --env-file .env -e DEBUG=False -e DB_HOST=<host-do-banco> ecommerce-backend python manage.py migrate
+```
+
+Atrás de HTTPS use `BEHIND_PROXY=True`. Configure a sonda de saúde do balanceador em `GET /api/health/` (não é redirecionada
+para HTTPS). Agende também o `expire_pending_orders` no servidor.
 
 ## Privacidade (LGPD)
 
@@ -200,7 +262,7 @@ Para atender a um pedido de exclusão de dados, anonimize a conta:
 python manage.py anonymize_user pessoa@example.com
 ```
 
-Remove nome e e-mail, desativa a conta, apaga tokens e carrinho e libera o e-mail para um novo cadastro.
+Remove nome e e-mail, desativa a conta, apaga tokens, carrinho, endereços e avaliações e libera o e-mail para um novo cadastro.
 O histórico de pedidos é mantido (obrigação fiscal), com o endereço de entrega que foi copiado para cada pedido.
 Contas de equipe (`is_staff`) não podem ser anonimizadas por esse comando.
 
@@ -213,7 +275,7 @@ python manage.py test   # testes
 ```
 
 O GitHub Actions (`.github/workflows/ci.yml`) roda tudo isso, mais `makemigrations --check` e
-`check --deploy`, a cada push e pull request, com PostgreSQL 17 e `DEBUG=False`.
+`check --deploy` e o build da imagem Docker, a cada push e pull request, com PostgreSQL 17 e `DEBUG=False`.
 
 ## Estrutura
 
@@ -223,11 +285,14 @@ backend/
 ├── products/    # catálogo
 ├── accounts/    # usuários e autenticação
 ├── cart/        # carrinho
-├── orders/      # pedidos
-├── payments/    # pagamentos e webhooks
+├── coupons/     # cupons de desconto
+├── orders/      # pedidos, frete e e-mails
+├── payments/    # pagamentos, webhooks e estornos
+├── reviews/     # avaliações
 ├── docs/        # planos e decisões (ex.: Mercado Pago)
 ├── .github/     # CI
-├── docker-compose.yml
+├── Dockerfile
+├── docker-compose.yml   # só o PostgreSQL de desenvolvimento
 └── manage.py
 ```
 
@@ -245,7 +310,7 @@ backend/
 ## Roadmap
 
 - Adaptador do Mercado Pago (Pix e cartão): plano e pendências em [docs/mercadopago.md](docs/mercadopago.md).
-- Modelo `Address` e cálculo de frete.
-- Cupons de desconto e avaliações de produtos.
-- Verificação de e-mail e recuperação de senha.
-- Documentação OpenAPI.
+- Frete por CEP/transportadora (hoje é valor fixo com faixa de frete grátis).
+- Verificação de e-mail no cadastro.
+- Devolução de pedidos já enviados e estorno automático pelo provedor.
+- Fila de e-mails (Celery) caso o volume cresça; hoje o envio é síncrono, logo após o commit.
