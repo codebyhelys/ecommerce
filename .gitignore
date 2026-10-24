@@ -19,3 +19,6 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Teste de carga: tokens de acesso dos usuários de teste
+loadtest/tokens.json

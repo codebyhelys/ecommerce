@@ -3,6 +3,10 @@ import logging
 from django.conf import settings
 from django.core.mail import send_mail
 
+from core.tasks import enqueue
+
+from .models import Order
+
 logger = logging.getLogger(__name__)
 
 SUBJECTS = {
@@ -47,13 +51,20 @@ def build_order_email(order, event):
     return SUBJECTS[event].format(id=order.pk), "\n".join(lines)
 
 
+def deliver_order_email(order_id, event):
+    """Monta e envia o e-mail. Levanta em caso de falha (a tarefa do Celery tenta de novo)."""
+    order = Order.objects.select_related("user").prefetch_related("items").filter(pk=order_id).first()
+    if order is None:
+        logger.warning("E-mail '%s' ignorado: pedido %s não existe mais", event, order_id)
+        return
+    if not order.user.is_active:  # conta encerrada/anonimizada
+        return
+    subject, body = build_order_email(order, event)
+    send_mail(subject, body, settings.DEFAULT_FROM_EMAIL, [order.user.email])
+
+
 def send_order_email(order, event):
-    """Avisa o cliente. Nunca derruba quem chamou: o e-mail é consequência do pedido, não parte dele."""
-    try:
-        user = order.user
-        if not user.is_active:  # conta encerrada/anonimizada
-            return
-        subject, body = build_order_email(order, event)
-        send_mail(subject, body, settings.DEFAULT_FROM_EMAIL, [user.email])
-    except Exception:
-        logger.exception("Falha ao enviar o e-mail '%s' do pedido %s", event, getattr(order, "pk", "?"))
+    """Avisa o cliente em segundo plano. Nunca derruba quem chamou: o e-mail é consequência do pedido."""
+    from .tasks import send_order_email_task
+
+    enqueue(send_order_email_task, order.pk, event, inline=deliver_order_email)

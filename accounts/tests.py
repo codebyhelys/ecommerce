@@ -491,3 +491,45 @@ class PasswordTests(APITestCase):
             self.confirm_url, {"uid": uid, "token": token, "new_password": self.NEW}, format="json"
         )
         self.assertEqual(response.status_code, 400)
+
+
+class PasswordResetQueueTests(TestCase):
+    def setUp(self):
+        from accounts.tasks import send_password_reset_email_task
+
+        self.task = send_password_reset_email_task
+        self.user = User.objects.create_user("ana@example.com", password="Senha-forte-123")
+
+    def test_only_the_user_id_goes_through_the_queue_never_the_token(self):
+        from unittest import mock
+
+        from accounts.services import request_password_reset
+
+        with mock.patch.object(self.task, "delay") as delay:
+            request_password_reset("ana@example.com")
+        delay.assert_called_once_with(self.user.pk)
+
+    def test_unknown_emails_enqueue_nothing(self):
+        from unittest import mock
+
+        from accounts.services import request_password_reset
+
+        with mock.patch.object(self.task, "delay") as delay:
+            request_password_reset("ninguem@example.com")
+        delay.assert_not_called()
+
+    def test_the_link_is_built_when_the_task_runs(self):
+        from django.core import mail
+
+        from accounts.services import request_password_reset
+
+        request_password_reset("ana@example.com")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("/redefinir-senha?uid=", mail.outbox[0].body)
+
+    def test_the_email_is_skipped_if_the_account_was_closed_meanwhile(self):
+        from django.core import mail
+
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        self.task.delay(self.user.pk)
+        self.assertEqual(len(mail.outbox), 0)

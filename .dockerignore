@@ -9,3 +9,4 @@ staticfiles/
 docs/
 .ruff_cache/
 .github/
+loadtest/

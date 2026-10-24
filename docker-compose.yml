@@ -1,5 +1,25 @@
 name: ecommerce
 
+# Ambiente de TESTE DE CARGA (perfil `loadtest`): banco, cache e fila PRÓPRIOS; nunca toca nos de desenvolvimento.
+# Limites de requisição elevados, e-mail descartado e gateway fake. Veja loadtest/README.md.
+x-load-env: &load-env
+  DEBUG: "False"
+  SECURE_SSL_REDIRECT: "False"
+  ALLOWED_HOSTS: localhost,load-web
+  DB_NAME: ecommerce_load
+  DB_HOST: db
+  DB_PORT: "5432"
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/2
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/3
+  EMAIL_BACKEND: django.core.mail.backends.dummy.EmailBackend
+  PAYMENT_GATEWAY: fake
+  PAYMENT_WEBHOOK_SECRET: load-test-secret
+  THROTTLE_ANON_RATE: 1000000/min
+  THROTTLE_USER_RATE: 1000000/min
+  S3_BUCKET_NAME: ""
+  WEB_CONCURRENCY: ${LOAD_WEB_CONCURRENCY:-3}      # para experimentar: LOAD_WEB_CONCURRENCY=8 docker compose ... up -d load-web
+  GUNICORN_THREADS: ${LOAD_GUNICORN_THREADS:-4}
+
 services:
   db:
     image: postgres:17
@@ -14,5 +34,106 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # cache e contadores de throttling compartilhados entre workers; nada aqui precisa sobreviver a reinício
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce_redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: >
+      sh -c 'exec redis-server
+      --requirepass "$$REDIS_PASSWORD"
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no'
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Armazenamento de objetos compatível com S3 (imagens de produto), só para desenvolvimento.
+  # O MinIO deixou de publicar imagens oficiais; o SeaweedFS fala o mesmo protocolo, então o código não muda
+  # (em produção use S3, R2 ou outro serviço S3: só as variáveis S3_* mudam).
+  storage:
+    image: chrislusf/seaweedfs:4.48
+    container_name: ecommerce_storage
+    restart: unless-stopped
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-ecommerce-media}
+    entrypoint: ["/bin/sh", "-c"]
+    # credenciais montadas a partir do ambiente; leitura anônima só no bucket de mídia (as imagens são públicas)
+    command:
+      - |
+        printf '{"identities":[{"name":"app","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]},{"name":"anonymous","actions":["Read:%s"]}]}' "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" "$$S3_BUCKET_NAME" > /tmp/s3.json
+        exec weed server -dir=/data -s3 -s3.config=/tmp/s3.json -ip.bind=0.0.0.0
+    ports:
+      - "127.0.0.1:${STORAGE_PORT:-8333}:8333"
+    volumes:
+      - storage_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # roda uma vez, cria o bucket e termina
+  storage-setup:
+    image: amazon/aws-cli:2.34.1
+    restart: "no"
+    depends_on:
+      storage:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-ecommerce-media}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://storage:8333 s3api head-bucket --bucket "$$S3_BUCKET_NAME" 2>/dev/null || aws --endpoint-url http://storage:8333 s3api create-bucket --bucket "$$S3_BUCKET_NAME"; do sleep 2; done
+        echo "bucket $$S3_BUCKET_NAME pronto"
+
+  load-web:
+    profiles: ["loadtest"]
+    build: .
+    image: ecommerce-backend:loadtest
+    container_name: ecommerce_load_web
+    env_file: .env
+    environment: *load-env
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "127.0.0.1:18000:8000"
+
+  load-worker:
+    profiles: ["loadtest"]
+    image: ecommerce-backend:loadtest
+    container_name: ecommerce_load_worker
+    env_file: .env
+    environment: *load-env
+    command: ["celery", "-A", "core", "worker", "-l", "warning", "--concurrency", "4"]
+    depends_on:
+      - load-web
+
+  k6:
+    profiles: ["loadtest"]
+    image: grafana/k6:2.3.0
+    volumes:
+      - ./loadtest:/scripts:ro
+    environment:
+      BASE_URL: http://load-web:8000/api
+    depends_on:
+      - load-web
+
 volumes:
   postgres_data:
+  storage_data:

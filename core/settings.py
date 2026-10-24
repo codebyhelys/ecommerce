@@ -107,6 +107,10 @@ DATABASES = {
         'PORT': config('DB_PORT', default='5432'),
         # falha rápido (com erro claro) quando o banco está fora do ar, em vez de ficar esperando
         'OPTIONS': {'connect_timeout': config('DB_CONNECT_TIMEOUT', default=10, cast=int)},
+        # reaproveita a conexão por 60 s em vez de abrir uma por requisição; antes de reusar, confirma que ainda vive.
+        # Cada thread do gunicorn mantém a sua: conexões = workers x threads (veja gunicorn.conf.py)
+        'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=60, cast=int),
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 
@@ -213,6 +217,40 @@ if config('BEHIND_PROXY', default=False, cast=bool):
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Cache (e contadores do throttling) compartilhado entre workers e máquinas. Sem REDIS_URL fica o cache em memória
+# do processo, que serve para testes e desenvolvimento, mas NÃO limita corretamente com mais de um worker.
+REDIS_URL = config('REDIS_URL', default='')
+if REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+            'KEY_PREFIX': 'ecommerce',
+            'TIMEOUT': 300,
+        }
+    }
+
+# Tarefas em segundo plano (e-mails, expiração de pedidos). O broker é o Redis, em OUTRO banco lógico que o cache:
+# o `cache.clear()` do Django apaga o banco inteiro e não pode levar a fila junto.
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='')
+# sem broker (desenvolvimento simples e testes) as tarefas rodam na hora, no próprio processo
+CELERY_TASK_ALWAYS_EAGER = not CELERY_BROKER_URL
+CELERY_TASK_ACKS_LATE = (
+    True  # se o worker morrer no meio, a tarefa volta para a fila (pode repetir: tarefas toleram isso)
+)
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_IGNORE_RESULT = True
+CELERY_TASK_SOFT_TIME_LIMIT = 90
+CELERY_TASK_TIME_LIMIT = 120
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 3600}
+CELERY_TIMEZONE = 'America/Sao_Paulo'
+# só roda onde alguém inicia o processo `celery -A core beat` (no servidor; não na máquina de desenvolvimento)
+CELERY_BEAT_SCHEDULE = {
+    'expire-pending-orders': {'task': 'orders.expire_pending_orders', 'schedule': 300.0},
+}
+
 STORAGES = {
     'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
     # serve o CSS/JS do admin pelo próprio gunicorn (sem manifesto: não exige collectstatic nos testes)
@@ -223,6 +261,29 @@ STORAGES = {
 MEDIA_URL = 'media/'
 MEDIA_ROOT = config('MEDIA_ROOT', default=str(BASE_DIR / 'media'))
 PRODUCT_IMAGE_MAX_BYTES = config('PRODUCT_IMAGE_MAX_BYTES', default=5 * 1024 * 1024, cast=int)
+
+# Armazenamento de objetos (S3, R2, SeaweedFS...): ligado quando S3_BUCKET_NAME está definido.
+# As imagens são públicas e têm nome aleatório; por isso a URL é direta (sem assinatura) e cacheável para sempre.
+S3_BUCKET_NAME = config('S3_BUCKET_NAME', default='')
+if S3_BUCKET_NAME:
+    STORAGES['default'] = {
+        'BACKEND': 'storages.backends.s3.S3Storage',
+        'OPTIONS': {
+            'bucket_name': S3_BUCKET_NAME,
+            'access_key': config('S3_ACCESS_KEY'),
+            'secret_key': config('S3_SECRET_KEY'),
+            'endpoint_url': config('S3_ENDPOINT_URL', default='') or None,  # vazio = AWS S3
+            'region_name': config('S3_REGION', default='us-east-1'),
+            'addressing_style': config('S3_ADDRESSING_STYLE', default='virtual'),  # 'path' em servidores locais
+            # domínio (e pasta) público dos arquivos: um CDN, ou o endereço do servidor + bucket
+            'custom_domain': config('S3_PUBLIC_DOMAIN', default='') or None,
+            'url_protocol': config('S3_PUBLIC_PROTOCOL', default='https:'),
+            'querystring_auth': False,
+            'file_overwrite': False,
+            'default_acl': None,
+            'object_parameters': {'CacheControl': 'public, max-age=31536000, immutable'},
+        },
+    }
 
 LOGGING = {
     'version': 1,
@@ -235,6 +296,11 @@ LOGGING = {
 # Testes: hash de senha rápido (o PBKDF2 padrão deixa a suíte lenta e não é o que está sendo testado)
 if sys.argv[1:2] == ['test']:
     PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+    # e cache em memória: a suíte não depende do Redis e `cache.clear()` dos testes não apaga o do desenvolvimento
+    CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+    # sem broker (tarefas na hora) e sem armazenamento remoto: a suíte não depende de nenhum serviço além do PostgreSQL
+    CELERY_TASK_ALWAYS_EAGER = True
+    STORAGES['default'] = {'BACKEND': 'django.core.files.storage.FileSystemStorage'}
 
 # E-mail (em desenvolvimento imprime no console; em produção configure o SMTP pelo ambiente)
 EMAIL_BACKEND = config('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')

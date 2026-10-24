@@ -660,3 +660,79 @@ class CancelPaidOrderTests(TestCase):
         self.payment.refresh_from_db()
         self.assertEqual(self.order.status, Order.Status.CANCELLED)
         self.assertTrue(self.payment.needs_refund)
+
+
+class OrderEmailTaskTests(TestCase):
+    def setUp(self):
+        from .emails import deliver_order_email
+        from .tasks import expire_pending_orders_task, send_order_email_task
+
+        self.deliver, self.task, self.expire_task = (
+            deliver_order_email,
+            send_order_email_task,
+            expire_pending_orders_task,
+        )
+        self.user = User.objects.create_user("ana@example.com", password=PASSWORD)
+        make_catalog()
+        add_item(self.user, "camiseta", 1)
+        self.order = create_order(user=self.user, shipping=SHIPPING)
+
+    def test_the_task_arguments_are_plain_json(self):
+        import json
+
+        json.dumps([self.order.pk, "created"])  # o broker só leva tipos simples: nunca o objeto Order
+
+    def test_a_task_for_a_deleted_order_is_a_no_op(self):
+        self.deliver(999999, "created")  # não levanta
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_failures_are_retried_until_the_limit_and_then_dropped(self):
+        with mock.patch("orders.emails.send_mail", side_effect=OSError("SMTP fora do ar")) as send:
+            self.task.delay(self.order.pk, "created")
+        self.assertEqual(send.call_count, self.task.max_retries + 1)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_a_transient_failure_is_retried_and_the_email_goes_out(self):
+        real_send = mail.send_mail
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise OSError("falha momentânea")
+            return real_send(*args, **kwargs)
+
+        with mock.patch("orders.emails.send_mail", side_effect=flaky):
+            self.task.delay(self.order.pk, "created")
+        self.assertEqual((calls["n"], len(mail.outbox)), (3, 1))
+
+    def test_when_the_broker_is_down_the_email_is_sent_inline(self):
+        from .emails import send_order_email
+
+        with mock.patch.object(self.task, "delay", side_effect=ConnectionError("broker fora do ar")):
+            send_order_email(self.order, "created")
+        self.assertEqual([m.subject for m in mail.outbox], [f"Recebemos o seu pedido #{self.order.pk}"])
+
+    def test_when_both_the_broker_and_smtp_are_down_nothing_raises(self):
+        from .emails import send_order_email
+
+        with (
+            mock.patch.object(self.task, "delay", side_effect=ConnectionError("broker")),
+            mock.patch("orders.emails.send_mail", side_effect=OSError("smtp")),
+        ):
+            send_order_email(self.order, "created")  # só registra no log
+
+    def test_the_expiration_task_cancels_old_pending_orders(self):
+        Order.objects.filter(pk=self.order.pk).update(created_at=timezone.now() - timedelta(hours=3))
+        self.expire_task.delay()
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CANCELLED)
+
+    def test_the_expiration_runs_every_five_minutes_in_the_schedule(self):
+        from django.conf import settings
+
+        entry = settings.CELERY_BEAT_SCHEDULE["expire-pending-orders"]
+        self.assertEqual((entry["task"], entry["schedule"]), ("orders.expire_pending_orders", 300.0))
+        from core.celery import app
+
+        self.assertIn(entry["task"], app.tasks)

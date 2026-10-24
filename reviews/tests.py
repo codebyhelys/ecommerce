@@ -212,6 +212,13 @@ class ProductRatingSummaryTests(APITestCase):
             Review.objects.create(product=extra, user=make_user(f"x{i}@example.com"), rating=3)
         self.assertEqual(count_queries()[0], baseline)
 
+    def test_pagination_count_does_not_join_the_reviews_table(self):
+        # o JOIN + GROUP BY das avaliações no COUNT e na página custava 10x mais (veja loadtest/README.md)
+        with CaptureQueriesContext(connection) as ctx:
+            self.client.get(reverse("product-list"))
+        count_sql = next(q["sql"] for q in ctx.captured_queries if "COUNT(" in q["sql"])
+        self.assertNotIn("reviews_review", count_sql)
+
     def test_the_review_list_does_not_query_per_review(self):
         url = reverse("review-list", kwargs={"product_slug": "camiseta"})
 

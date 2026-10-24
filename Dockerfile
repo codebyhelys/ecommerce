@@ -21,4 +21,5 @@ USER app
 
 EXPOSE 8000
 # migrações NÃO rodam aqui: execute `python manage.py migrate` como passo de release (veja o README)
-CMD ["gunicorn", "core.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--access-logfile", "-"]
+# workers, threads e timeouts vêm do gunicorn.conf.py (ajustáveis por WEB_CONCURRENCY e GUNICORN_THREADS)
+CMD ["gunicorn", "core.wsgi:application"]
