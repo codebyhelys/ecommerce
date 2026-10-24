@@ -62,6 +62,15 @@ docker compose up -d
 O container usa `DB_NAME`, `DB_USER`, `DB_PASSWORD` e `DB_PORT` do `.env`. Se a porta 5432 estiver ocupada,
 mude `DB_PORT` no `.env` antes de subir.
 
+O mesmo comando sobe o **Redis** (cache e contadores do throttling), com `REDIS_PORT` e `REDIS_PASSWORD` do `.env`.
+Para o Django usá-lo, defina `REDIS_URL` (ex.: `redis://:SENHA@127.0.0.1:16379/0`). Sem `REDIS_URL` o cache fica
+em memória, o que basta em desenvolvimento, mas **o limite de requisições deixa de valer entre workers**: em produção
+`REDIS_URL` é obrigatório. A suíte de testes sempre usa o cache em memória.
+
+E o **armazenamento de objetos** para as imagens (SeaweedFS, compatível com S3): o serviço `storage` sobe o servidor e o
+`storage-setup` cria o bucket e termina. Usa `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET_NAME` e `STORAGE_PORT` do `.env`.
+Com `S3_BUCKET_NAME` definido, o Django grava e lê as imagens ali (veja *Armazenamento de arquivos*).
+
 **4. Migrations e superusuário**
 
 ```bash
@@ -100,7 +109,14 @@ elas disputam o mesmo banco de teste.
 | `DB_NAME`, `DB_USER`, `DB_PASSWORD` | — (obrigatórias) | Credenciais do PostgreSQL |
 | `DB_HOST` | `127.0.0.1` | Host do banco (use IPv4: `localhost` pode resolver para `::1` e travar) |
 | `DB_CONNECT_TIMEOUT` | `10` | Segundos até desistir de conectar ao banco |
+| `DB_CONN_MAX_AGE` | `60` | Segundos que cada conexão com o banco é reaproveitada (`0` abre uma por requisição) |
+| `WEB_CONCURRENCY` | `3` | Processos (workers) do gunicorn no container |
+| `GUNICORN_THREADS` | `4` | Threads por worker. Requisições simultâneas = workers x threads |
+| `GUNICORN_MAX_REQUESTS` | `0` (desligado) | Recicla cada worker após N requisições. Só ligue atrás de um proxy que repita requisições: sem ele, cada reinício derruba conexões |
 | `DB_PORT` | `5432` | Porta publicada pelo container |
+| `REDIS_URL` | vazio (cache em memória) | Cache compartilhado e throttling. `rediss://` para TLS |
+| `REDIS_PORT`, `REDIS_PASSWORD` | `6379`, — | Porta e senha do container Redis do `docker-compose.yml` |
+| `CELERY_BROKER_URL` | vazio (tarefas rodam na hora, sem worker) | Broker das tarefas em segundo plano. Use o Redis em **outro banco lógico** que o cache (ex.: `/1`) |
 | `DEV_SERVER_PORT` | `8010` | Porta do `runserver` |
 | `PAYMENT_GATEWAY` | `fake` com `DEBUG=True`; vazio caso contrário | Provedor de pagamento. Em produção é obrigatório definir; `check --deploy` recusa `fake` |
 | `PAYMENT_WEBHOOK_SECRET` | vazio | Segredo da assinatura dos webhooks (vazio rejeita tudo) |
@@ -117,6 +133,13 @@ elas disputam o mesmo banco de teste.
 | `CORS_ALLOWED_ORIGINS` | localhost:3000 com `DEBUG=True`; vazio caso contrário | Origens do front-end autorizadas a chamar `/api/`, separadas por vírgula |
 | `MEDIA_ROOT` | `./media` | Pasta dos uploads (imagens de produto) |
 | `PRODUCT_IMAGE_MAX_BYTES` | `5242880` | Tamanho máximo de cada imagem (5 MB) |
+| `S3_BUCKET_NAME` | vazio (disco local) | Liga o armazenamento de objetos |
+| `S3_ACCESS_KEY`, `S3_SECRET_KEY` | — (obrigatórias com bucket) | Credenciais. Em produção use uma chave só com acesso a esse bucket |
+| `S3_ENDPOINT_URL` | vazio (AWS S3) | Endereço do servidor S3-compatível (R2, SeaweedFS...) |
+| `S3_REGION` | `us-east-1` | Região |
+| `S3_ADDRESSING_STYLE` | `virtual` | `path` em servidores locais |
+| `S3_PUBLIC_DOMAIN`, `S3_PUBLIC_PROTOCOL` | vazio, `https:` | Endereço público das imagens (CDN, ou servidor + `/bucket`). Em desenvolvimento use `http:` |
+| `STORAGE_PORT` | `8333` | Porta do servidor S3 de desenvolvimento no `docker-compose.yml` |
 | `LOG_LEVEL` | `INFO` | Nível dos logs no console |
 | `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE` | `True` se `DEBUG=False` | Segurança de produção |
 | `SECURE_HSTS_SECONDS` | `3600` se `DEBUG=False` | HSTS (aumente gradualmente em produção) |
@@ -199,10 +222,30 @@ A página usa assets de CDN. A geração do esquema é validada nos testes: uma 
 - **Uploads com nome aleatório**, formato e tamanho validados; o arquivo some junto com a linha (após o commit).
 - **Avaliações**: nota média e contagem calculadas na própria consulta da listagem (sem N+1).
 - **Anonimização** (LGPD) apaga também endereços e avaliações.
+- **E-mails em segundo plano** (Celery): a requisição só enfileira. Falha de SMTP é repetida com espera crescente (até 5 vezes);
+  se o broker estiver fora do ar, o e-mail é enviado na hora. A redefinição de senha também é enfileirada, então a resposta
+  demora o mesmo exista a conta ou não.
+- **Arquivos fora do disco do servidor**: as imagens vão para um armazenamento S3-compatível, e várias instâncias compartilham o mesmo bucket.
 
-## Tarefas agendadas
+## Tarefas em segundo plano (Celery)
 
-Pedidos pendentes seguram estoque. Agende o comando abaixo para rodar a cada poucos minutos
+E-mails (pedido e redefinição de senha) e a expiração de pedidos rodam em um **worker** separado, com o Redis como broker.
+Sem `CELERY_BROKER_URL` (padrão em desenvolvimento e nos testes) as tarefas rodam na hora, dentro da requisição, e não
+é preciso worker.
+
+Para usar a fila, defina `CELERY_BROKER_URL` no `.env` (mesmo Redis do cache, banco `/1`) e rode, em terminais separados:
+
+```bash
+celery -A core worker -l info -P solo     # -P solo é necessário no Windows; no Linux omita
+celery -A core beat -l info               # agendador: só no servidor, e UMA única instância
+```
+
+O `beat` dispara o `expire_pending_orders` a cada 5 minutos (`CELERY_BEAT_SCHEDULE`). Não o rode na máquina de desenvolvimento.
+Se o worker estiver parado, as tarefas esperam na fila e saem quando ele voltar.
+
+## Tarefas agendadas (sem Celery)
+
+Pedidos pendentes seguram estoque. Sem o `beat`, agende o comando abaixo para rodar a cada poucos minutos
 (cron no Linux, Agendador de Tarefas no Windows):
 
 ```bash
@@ -233,12 +276,19 @@ Não agende na sua máquina de desenvolvimento: ele cancelaria pedidos de teste 
   defina `SECURE_SSL_REDIRECT=False`.
 - Valide com `python manage.py check --deploy`.
 - Defina `CORS_ALLOWED_ORIGINS` (domínio do front-end), `EMAIL_BACKEND` SMTP e `FRONTEND_URL`.
-- **Uploads**: o Django não serve `/media/` com `DEBUG=False`. Sirva `MEDIA_ROOT` pelo proxy (nginx) ou troque o storage por
-  um bucket de objetos, e mantenha a pasta em um volume persistente.
+- **Uploads**: o Django não serve `/media/` com `DEBUG=False`. Use um bucket S3-compatível (veja *Armazenamento de arquivos*).
+  Sem `S3_BUCKET_NAME` as imagens ficam em `MEDIA_ROOT`, que precisa de volume persistente e de um proxy servindo `/media/`.
+- **Redis**: `REDIS_URL` e `CELERY_BROKER_URL` são obrigatórios. Sem o primeiro, o limite de requisições vale por processo; sem o
+  segundo, os e-mails atrasam a resposta.
 
 ### Docker
 
-O `Dockerfile` gera uma imagem com gunicorn (3 workers), estáticos servidos por WhiteNoise e usuário sem privilégios.
+O `Dockerfile` gera uma imagem com gunicorn (3 workers x 4 threads, em `gunicorn.conf.py`), estáticos servidos por
+WhiteNoise e usuário sem privilégios.
+
+**Dimensionamento:** cada thread mantém uma conexão com o PostgreSQL, então um container usa até
+`WEB_CONCURRENCY x GUNICORN_THREADS` conexões (12 por padrão). Some todos os containers e compare com o
+`max_connections` do banco (100 por padrão); passando disso, coloque um PgBouncer na frente.
 
 ```bash
 docker build -t ecommerce-backend .
@@ -251,8 +301,30 @@ As migrações **não** rodam sozinhas ao subir o container. Execute-as como pas
 docker run --rm --env-file .env -e DEBUG=False -e DB_HOST=<host-do-banco> ecommerce-backend python manage.py migrate
 ```
 
+O **worker** e o **beat** usam a mesma imagem, com outro comando:
+
+```bash
+docker run -d --env-file .env -e DEBUG=False ecommerce-backend celery -A core worker -l info --concurrency 4
+docker run -d --env-file .env -e DEBUG=False ecommerce-backend celery -A core beat -l info --schedule /tmp/celerybeat-schedule
+```
+
+Rode **uma só** instância do `beat` (duas disparariam cada tarefa duas vezes); workers podem ser quantos precisar.
+
 Atrás de HTTPS use `BEHIND_PROXY=True`. Configure a sonda de saúde do balanceador em `GET /api/health/` (não é redirecionada
-para HTTPS). Agende também o `expire_pending_orders` no servidor.
+para HTTPS).
+
+## Armazenamento de arquivos
+
+As imagens de produto são públicas e têm nome aleatório, então são servidas por URL direta (sem assinatura), com
+`Cache-Control` de um ano. Em desenvolvimento, o `docker-compose.yml` sobe um servidor S3-compatível (**SeaweedFS**; o MinIO
+deixou de publicar imagens oficiais). Em produção troque só as variáveis `S3_*`:
+
+- **AWS S3**: bucket com leitura pública do prefixo `products/`, uma chave de acesso só para esse bucket e, se quiser CDN,
+  `S3_PUBLIC_DOMAIN` com o domínio dele.
+- **Cloudflare R2 ou outro compatível**: informe `S3_ENDPOINT_URL` e `S3_PUBLIC_DOMAIN`.
+
+O bucket não deve permitir listagem nem escrita anônimas (em desenvolvimento só há leitura anônima).
+Trocar de storage não migra as imagens existentes: copie os arquivos de `MEDIA_ROOT` para o bucket mantendo os nomes.
 
 ## Privacidade (LGPD)
 
@@ -313,4 +385,4 @@ backend/
 - Frete por CEP/transportadora (hoje é valor fixo com faixa de frete grátis).
 - Verificação de e-mail no cadastro.
 - Devolução de pedidos já enviados e estorno automático pelo provedor.
-- Fila de e-mails (Celery) caso o volume cresça; hoje o envio é síncrono, logo após o commit.
+- Monitoramento das filas (Flower ou métricas do Redis) e alarmes para e-mails que esgotaram as tentativas.
