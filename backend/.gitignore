@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+*.log
+media/
+staticfiles/
+
+# Ambiente
+.env
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Teste de carga: tokens de acesso dos usuários de teste
+loadtest/tokens.json
