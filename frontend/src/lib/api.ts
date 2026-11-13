@@ -67,3 +67,13 @@ export async function getCategories(): Promise<Category[]> {
     return [];
   }
 }
+
+export async function getProduct(slug: string): Promise<Product | null> {
+  "use cache";
+  cacheLife("minutes");
+
+  const res = await fetch(`${API_URL}/products/${encodeURIComponent(slug)}/`);
+  if (res.status === 404) return null; // este produto realmente não existe
+  if (!res.ok) throw new Error(`API respondeu ${res.status}`);
+  return res.json();
+}
